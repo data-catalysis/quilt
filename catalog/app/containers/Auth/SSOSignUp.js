@@ -78,11 +78,11 @@ export default ({ location: { search } }) => {
         throw new SubmissionError({ _error: 'unexpected' })
       }
     },
-    [provider, token, next, urls, dispatch],
+    [provider, token, next, urls, dispatch, sentry],
   )
 
   if (authenticated) {
-    return <Redirect to={next || cfg.signInRedirect} />
+    return <Redirect to={next || '/'} />
   }
 
   return (

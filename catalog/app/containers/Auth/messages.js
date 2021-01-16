@@ -29,7 +29,7 @@ export default defineMessages({
   // SSO
   ssoGoogleUse: {
     id: `${scope}.SSO.Google.use`,
-    defaultMessage: 'Use Google Account',
+    defaultMessage: 'Sign in with Google',
   },
   ssoGoogleError: {
     id: `${scope}.SSO.Google.error`,
@@ -46,7 +46,7 @@ export default defineMessages({
   },
   ssoOktaUse: {
     id: `${scope}.SSO.Okta.use`,
-    defaultMessage: 'Use Okta Account',
+    defaultMessage: 'Sign in with Okta',
   },
   ssoOktaError: {
     id: `${scope}.SSO.Okta.error`,
@@ -60,6 +60,24 @@ export default defineMessages({
     id: `${scope}.SSO.Okta.notFound`,
     defaultMessage:
       'No Quilt user linked to this Okta account. Notify your Quilt administrator.',
+  },
+  ssoOneLoginUse: {
+    id: `${scope}.SSO.OneLogin.use`,
+    defaultMessage: 'Sign in with OneLogin',
+  },
+  ssoOneLoginError: {
+    id: `${scope}.SSO.OneLogin.error`,
+    defaultMessage: 'Unable to sign in with OneLogin. {details}',
+  },
+  ssoOneLoginErrorUnexpected: {
+    id: `${scope}.SSO.OneLogin.errorUnexpected`,
+    defaultMessage:
+      'Unable to sign in with OneLogin. Try again later or contact support.',
+  },
+  ssoOneLoginNotFound: {
+    id: `${scope}.SSO.OneLogin.notFound`,
+    defaultMessage:
+      'No Quilt user linked to this OneLogin account. Notify your Quilt administrator.',
   },
   ssoSignUpHeading: {
     id: `${scope}.SSO.SignUp.heading`,

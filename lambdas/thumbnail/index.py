@@ -16,18 +16,18 @@ from typing import List, Tuple
 
 import imageio
 import numpy as np
+import requests
+from aicsimageio import AICSImage, readers
 from pdf2image import convert_from_bytes
 from pdf2image.exceptions import (
     PDFInfoNotInstalledError,
     PDFPageCountError,
     PDFSyntaxError,
-    PopplerNotInstalledError
+    PopplerNotInstalledError,
 )
-import requests
-from aicsimageio import AICSImage, readers
 from PIL import Image
 
-from t4_lambda_shared.decorator import api, QUILT_INFO_HEADER, validate
+from t4_lambda_shared.decorator import QUILT_INFO_HEADER, api, validate
 from t4_lambda_shared.utils import get_default_origins, make_json_response
 
 # Eventually we'll want to precompute/cache thumbnails, so we won't be able to support
@@ -163,7 +163,7 @@ def _format_n_dim_ndarray(img: AICSImage) -> np.ndarray:
         img = AICSImage(img.data[0, :, :, :, :, :])
     # Always choose middle time slice
     if "T" in img.reader.dims:
-        img = AICSImage(img.data[0, img.data.shape[1] / 2, :, :, :, :])
+        img = AICSImage(img.data[0, img.data.shape[1] // 2, :, :, :, :])
 
     # Keep Channel data, but max project when possible
     if "C" in img.reader.dims:
@@ -239,7 +239,7 @@ def set_pdf_env():
     # libs
     os.environ["LD_LIBRARY_PATH"] += os.pathsep + os.path.join(lambda_root, prefix, 'usr', 'lib64')
     # fonts
-    os.environ["FONTCONFIG_PATH"] = os.path.join(lambda_root, prefix, 'fonts')
+    os.environ["FONTCONFIG_FILE"] = os.path.join(lambda_root, prefix, 'fonts', 'fonts.conf')
 
 
 @api(cors_origins=get_default_origins())
@@ -269,8 +269,11 @@ def lambda_handler(request):
         if input_ == "pdf":
             set_pdf_env()
             try:
-                # respect width but not necessarily height (to preserve aspect ratio)
-                kwargs = {"size": (size[0], None)}
+                kwargs = {
+                    # respect width but not necessarily height to preserve aspect ratio
+                    "size": (size[0], None),
+                    "fmt": "JPEG",
+                }
                 if not count_pages:
                     kwargs["first_page"] = page
                     kwargs["last_page"] = page
@@ -342,6 +345,7 @@ def lambda_handler(request):
 
     # Errored, return error code
     ret_val = {
-        'error': resp.reason
+        'error': resp.reason,
+        'text': resp.text,
     }
     return make_json_response(resp.status_code, ret_val)

@@ -7,16 +7,16 @@ import os
 
 import boto3
 import botocore
+import pandas as pd
 from botocore import UNSIGNED
 from botocore.client import Config
-import pandas as pd
 
 from t4_lambda_shared.decorator import api, validate
 from t4_lambda_shared.utils import (
-    query_manifest_content,
     get_default_origins,
     make_json_response,
-    sql_escape
+    query_manifest_content,
+    sql_escape,
 )
 
 SCHEMA = {
@@ -56,10 +56,20 @@ def file_list_to_folder(df: pd.DataFrame) -> dict:
     lambda).
     """
     try:
-        folder = pd.Series(df.logical_key.dropna().str.extract('([^/]+/?).*')[0].unique())
-        prefixes = folder[folder.str.endswith('/')].sort_values().tolist()
-        objects = folder[~folder.str.endswith('/')].sort_values().tolist()
-    except AttributeError:
+        groups = df.groupby(df.logical_key.str.extract('([^/]+/?).*')[0], dropna=True)
+        folder = groups.agg(
+            size=('size', 'sum'),
+            physical_key=('physical_key', 'first')
+        )
+        folder.reset_index(inplace=True)  # move the logical_key from the index to column[0]
+        folder.rename(columns={0: 'logical_key'}, inplace=True)  # name the new column
+        # Do not return physical_key for prefixes
+        prefixes = folder[folder.logical_key.str.contains('/')].drop(
+            ['physical_key'],
+            axis=1
+        ).to_dict(orient='records')
+        objects = folder[~folder.logical_key.str.contains('/')].to_dict(orient='records')
+    except AttributeError as err:
         # Pandas will raise an attribute error if the DataFrame has
         # no rows with a non-null logical_key. We expect that case if
         # either: (1) the package is empty (has zero package entries)
@@ -172,7 +182,10 @@ def lambda_handler(request):
         # Call s3 select to fetch only logical keys matching the
         # desired prefix (folder path)
         prefix_length = len(prefix) if prefix is not None else 0
-        sql_stmt = f"SELECT SUBSTRING(s.logical_key, {prefix_length + 1}) AS logical_key FROM s3object s"
+        sql_stmt = (
+            f"SELECT SUBSTRING(s.logical_key, {prefix_length + 1}) AS logical_key"
+            ", s.\"size\", s.physical_keys[0] as physical_key FROM s3object s"
+        )
         if prefix:
             sql_stmt += f" WHERE SUBSTRING(s.logical_key, 1, {prefix_length}) = '{sql_escape(prefix)}'"
         result = query_manifest_content(
@@ -184,6 +197,20 @@ def lambda_handler(request):
         # Parse the response into a logical folder view
         df = pd.read_json(result, lines=True)
         response_data = file_list_to_folder(df)
+
+        # Fetch package-level or directory-level metadata
+        if prefix:
+            sql_stmt = f"SELECT s.meta FROM s3object s WHERE s.logical_key = '{sql_escape(prefix)}'"
+        else:
+            sql_stmt = "SELECT s.* FROM s3object s WHERE s.logical_key is NULL"
+        result = query_manifest_content(
+            s3_client,
+            bucket=bucket,
+            key=key,
+            sql_stmt=sql_stmt
+        )
+        meta = json.load(result) if result else {}
+        response_data.update(dict(meta=meta))
 
     ret_val = make_json_response(
         200,

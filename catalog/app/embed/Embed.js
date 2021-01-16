@@ -11,7 +11,6 @@ import * as M from '@material-ui/core'
 import * as Layout from 'components/Layout'
 import Placeholder from 'components/Placeholder'
 import * as Auth from 'containers/Auth'
-import { BucketCacheProvider, useBucketCache } from 'containers/Bucket'
 import LanguageProvider from 'containers/LanguageProvider'
 import { ThrowNotFound, createNotFound } from 'containers/NotFoundPage'
 import * as Notifications from 'containers/Notifications'
@@ -19,8 +18,8 @@ import * as routes from 'constants/embed-routes'
 import * as style from 'constants/style'
 import * as APIConnector from 'utils/APIConnector'
 import * as AWS from 'utils/AWS'
+import * as BucketCache from 'utils/BucketCache'
 import * as Config from 'utils/Config'
-import { useData } from 'utils/Data'
 import { createBoundary } from 'utils/ErrorBoundary'
 import * as NamedRoutes from 'utils/NamedRoutes'
 import * as Cache from 'utils/ResourceCache'
@@ -30,13 +29,13 @@ import defer from 'utils/defer'
 import { ErrorDisplay } from 'utils/error'
 import * as RT from 'utils/reactTools'
 import RouterProvider from 'utils/router'
+import * as s3paths from 'utils/s3paths'
 import useConstant from 'utils/useConstant'
 import useMemoEq from 'utils/useMemoEq'
 import usePrevious from 'utils/usePrevious'
 
 // TODO: consider reimplementing these locally or moving to some shared location
 import { displayError } from 'containers/Bucket/errors'
-import * as requests from 'containers/Bucket/requests'
 
 import WithGlobalStyles from '../global-styles'
 
@@ -120,9 +119,7 @@ function Bucket({
 }
 
 function BucketLayout({ bucket, children }) {
-  const s3 = AWS.S3.use()
-  const cache = useBucketCache()
-  const data = useData(requests.bucketExists, { s3, bucket, cache })
+  const data = BucketCache.useBucketExistence(bucket)
   return (
     <>
       <AppBar bucket={bucket} />
@@ -147,9 +144,15 @@ function useInit() {
       const { type, ...init } = data
       try {
         if (!init.bucket) throw new Error('missing .bucket')
+        if (init.scope) {
+          if (typeof init.scope !== 'string') throw new Error('.scope must be a string')
+          init.scope = s3paths.ensureSlash(init.scope)
+        }
         setState(init)
       } catch (e) {
+        // eslint-disable-next-line no-console
         console.error(`Configuration error: ${e.message}`)
+        // eslint-disable-next-line no-console
         console.log('init object:', init)
         setState(e)
       }
@@ -198,11 +201,13 @@ function usePostInit(init) {
         setState(true)
       })
       .catch((e) => {
+        // eslint-disable-next-line no-console
         console.warn('Authentication failure:')
+        // eslint-disable-next-line no-console
         console.error(e)
         setState(new ErrorDisplay('Authentication Failure'))
       })
-  }, [init])
+  }, [init, dispatch])
 
   return state
 }
@@ -282,9 +287,8 @@ function App({ messages, init }) {
     AWS.Credentials.Provider,
     AWS.Config.Provider,
     AWS.S3.Provider,
-    AWS.Signer.Provider,
     Notifications.WithNotifications,
-    BucketCacheProvider,
+    BucketCache.Provider,
     [PostInit, { init }],
     Root,
   )

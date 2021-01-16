@@ -1,6 +1,3 @@
-const fs = require('fs')
-const path = require('path')
-
 const prettierOptions = require('./.prettierrc')
 
 module.exports = {
@@ -21,7 +18,7 @@ module.exports = {
     },
   },
   rules: {
-    'prettier/prettier': ['error', prettierOptions],
+    'prettier/prettier': [2, prettierOptions],
     'arrow-body-style': [2, 'as-needed'],
     'class-methods-use-this': 0,
     'import/imports-first': 0,
@@ -51,16 +48,21 @@ module.exports = {
     'max-len': 0,
     'newline-per-chained-call': 0,
     'no-confusing-arrow': 0,
-    'no-console': 1,
+    'no-console': 2,
+    'no-nested-ternary': 1,
+    'no-underscore-dangle': [2, { allow: ['_', '__'] }],
     'no-unused-vars': 2,
     'no-use-before-define': 0,
+    'prefer-arrow-callback': [2, { allowNamedFunctions: true }],
     'prefer-template': 2,
+    'react-hooks/exhaustive-deps': 2,
+    'react-hooks/rules-of-hooks': 2,
     'react/destructuring-assignment': 0,
     'react/forbid-prop-types': 0,
     'react/jsx-closing-tag-location': 0,
     'react/jsx-curly-brace-presence': 0,
-    'react/jsx-first-prop-new-line': [2, 'multiline'],
     'react/jsx-filename-extension': 0,
+    'react/jsx-first-prop-new-line': [2, 'multiline'],
     'react/jsx-no-target-blank': 0,
     'react/jsx-props-no-spreading': 0,
     'react/jsx-uses-vars': 2,
@@ -69,7 +71,7 @@ module.exports = {
     'react/require-extension': 0,
     'react/self-closing-comp': 0,
     'react/sort-comp': 0,
-    'react-hooks/rules-of-hooks': 'error',
+    'react/static-property-placement': [2, 'static public field'],
     'redux-saga/no-yield-in-race': 2,
     'redux-saga/yield-effects': 2,
     'require-yield': 0,

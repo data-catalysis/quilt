@@ -23,6 +23,45 @@ export class NoSuchBucket extends BucketError {}
 
 export class NoSuchPackage extends BucketError {}
 
+export class NoESIndex extends BucketError {}
+
+export class FileNotFound extends BucketError {}
+
+export class VersionNotFound extends BucketError {}
+
+export class WorkflowsConfigInvalid extends BucketError {
+  static displayName = 'WorkflowsConfigInvalid'
+
+  constructor(props) {
+    super(
+      props.errors.map(({ dataPath, message }) => `${dataPath} ${message}`).join(', '),
+      props,
+    )
+  }
+}
+
+export class ManifestTooLarge extends BucketError {
+  static displayName = 'ManifestTooLarge'
+
+  constructor(props) {
+    super(
+      `Package manifest at s3://${props.bucket}/${props.key} is too large: ${props.actualSize} (max size: ${props.maxSize})`,
+      props,
+    )
+  }
+}
+
+export class BadRevision extends BucketError {
+  static displayName = 'BadRevision'
+
+  constructor(props) {
+    super(
+      `Could not resolve revision "${props.revision}" for package "${props.handle}" in s3://${props.bucket}`,
+      props,
+    )
+  }
+}
+
 const WhenAuth = connect(
   createStructuredSelector({
     authenticated: Auth.selectors.authenticated,
@@ -58,6 +97,7 @@ const defaultHandlers = [
         Seems like this bucket is not configured for Quilt.
         <br />
         <StyledLink
+          target="_blank"
           href={`${docs}/references/technical-reference#deploy-a-private-quilt-instance-on-aws`}
         >
           Learn how to configure the bucket for Quilt
@@ -81,6 +121,18 @@ const defaultHandlers = [
     ),
   ],
   [
+    R.is(NoESIndex),
+    () => (
+      <Message headline="Oops, no search cluster">
+        The bucket owner needs to{' '}
+        <StyledLink target="_blank" href={docs}>
+          tie this bucket to Quilt
+        </StyledLink>{' '}
+        to enable Packages, Search, and detailed Overviews.
+      </Message>
+    ),
+  ],
+  [
     R.is(AccessDenied),
     whenAuth({
       true: () => (
@@ -88,6 +140,7 @@ const defaultHandlers = [
           Seems like you don&apos;t have access to this bucket.
           <br />
           <StyledLink
+            target="_blank"
             href={`${docs}/walkthrough/working-with-the-catalog#access-control`}
           >
             Learn about access control in Quilt
@@ -110,6 +163,50 @@ const defaultHandlers = [
 export const displayError = (pairs = []) =>
   R.cond([
     ...defaultHandlers,
+    ...pairs,
+    [
+      R.T,
+      (e) => {
+        throw e
+      },
+    ],
+  ])
+
+export const catchErrors = (pairs = []) =>
+  R.cond([
+    [
+      R.propEq('message', 'Network Failure'),
+      () => {
+        throw new CORSError()
+      },
+    ],
+    [
+      R.propEq('message', 'Access Denied'),
+      () => {
+        throw new AccessDenied()
+      },
+    ],
+    [
+      R.propEq('code', 'Forbidden'),
+      () => {
+        throw new AccessDenied()
+      },
+    ],
+    [
+      R.propEq('code', 'NoSuchBucket'),
+      () => {
+        throw new NoSuchBucket()
+      },
+    ],
+    [
+      R.propEq(
+        'message',
+        "API Gateway error (500): NotFoundError(404, 'index_not_found_exception', 'no such index')",
+      ),
+      () => {
+        throw new NoESIndex()
+      },
+    ],
     ...pairs,
     [
       R.T,

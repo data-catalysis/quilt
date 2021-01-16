@@ -77,7 +77,14 @@ export const profile = {
 // global search
 export const search = {
   path: '/search',
-  url: ({ q, buckets, p }) => `/search${mkSearch({ q, buckets, p })}`,
+  url: ({ q, buckets, p, mode, retry }) =>
+    `/search${mkSearch({ q, buckets, p, mode, retry })}`,
+}
+
+// immutable URI resolver
+export const uriResolver = {
+  path: '/uri/:uri(.*)',
+  url: (uri) => `/uri/${uri ? encodeURIComponent(uri) : ''}`,
 }
 
 // bucket
@@ -88,16 +95,18 @@ export const bucketRoot = {
 export const bucketOverview = bucketRoot
 export const bucketSearch = {
   path: '/b/:bucket/search',
-  url: (bucket, q, p) => `/b/${bucket}/search${mkSearch({ q, p })}`,
+  url: (bucket, { q, p, mode, retry } = {}) =>
+    `/b/${bucket}/search${mkSearch({ q, p, mode, retry })}`,
 }
 export const bucketFile = {
-  path: '/b/:bucket/tree/:path+',
+  path: '/b/:bucket/tree/:path(.*[^/])',
   url: (bucket, path, version) =>
     `/b/${bucket}/tree/${encode(path)}${mkSearch({ version })}`,
 }
 export const bucketDir = {
   path: '/b/:bucket/tree/:path(.+/)?',
-  url: (bucket, path = '') => `/b/${bucket}/tree/${encode(path)}`,
+  url: (bucket, path = '', prefix) =>
+    `/b/${bucket}/tree/${encode(path)}${mkSearch({ prefix: prefix || undefined })}`,
 }
 export const bucketPackageList = {
   path: '/b/:bucket/packages/',
@@ -111,9 +120,9 @@ export const bucketPackageDetail = {
 export const bucketPackageTree = {
   path: `/b/:bucket/packages/:name(${PACKAGE_PATTERN})/tree/:revision/:path(.*)?`,
   url: (bucket, name, revision, path = '') =>
-    revision === 'latest' && !path
-      ? bucketPackageDetail.url(bucket, name)
-      : `/b/${bucket}/packages/${name}/tree/${revision}/${encode(path)}`,
+    path || (revision && revision !== 'latest')
+      ? `/b/${bucket}/packages/${name}/tree/${revision || 'latest'}/${encode(path)}`
+      : bucketPackageDetail.url(bucket, name),
 }
 export const bucketPackageRevisions = {
   path: `/b/:bucket/packages/:name(${PACKAGE_PATTERN})/revisions`,

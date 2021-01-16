@@ -8,7 +8,6 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 import responses
-
 from index import lambda_handler, post_process
 
 ES_STATS_RESPONSES = {
@@ -227,29 +226,28 @@ class TestSearch(TestCase):
         assert map_stats['size']['value'] == sum(raw_stats[i]['size']['value'] for i in (7, 9)), \
             'Unexpected size for .map'
 
-    def test_search(self):
-        url = 'https://www.example.com:443/bucket/_search?' + urlencode(dict(
-            timeout='15s',
-            size=1000,
-            terminate_after=10000,
-            _source=','.join(['key', 'version_id', 'updated', 'last_modified', 'size', 'user_meta']),
-        ))
+    def test_packages(self):
+        """test packages action"""
+        query = {
+            'action': 'packages',
+            'index': 'bucket_packages',
+            'body': {'custom': 'body'},
+            'size': 42,
+            'from': 10,
+            '_source': ','.join(['great', 'expectations']),
+        }
+
+        url = f'https://www.example.com:443/{query["index"]}/_search?' + urlencode({
+            k: v for k, v in query.items() if k in [
+                'size', 'from', '_source'
+            ]
+        })
 
         def _callback(request):
             payload = json.loads(request.body)
-            assert payload == {
-                'query': {
-                    'simple_query_string': {
-                        'fields': [
-                            'content',
-                            'comment',
-                            'key_text',
-                            'meta_text'
-                        ],
-                        'query': '123'
-                    }
-                }
-            }
+            # check that user can override body
+            assert payload == query['body']
+
             return 200, {}, json.dumps({'results': 'blah'})
 
         self.requests_mock.add_callback(
@@ -257,7 +255,85 @@ class TestSearch(TestCase):
             url,
             callback=_callback,
             content_type='application/json',
-            match_querystring=True
+            match_querystring=True,
+        )
+
+        event = self._make_event(query)
+        resp = lambda_handler(event, None)
+        assert resp['statusCode'] == 200
+        assert json.loads(resp['body']) == {'results': 'blah'}
+
+    def test_packages_bad(self):
+        """test packages action with known bad index param"""
+        query = {
+            'action': 'packages',
+            'index': 'bucket',
+            'body': {'custom': 'body'},
+            'size': 42,
+            '_source': ['great', 'expectations']
+        }
+        # try a known bad query
+        event = self._make_event(query)
+        resp = lambda_handler(event, None)
+        assert resp['statusCode'] == 500
+
+    def test_packages_bad_from(self):
+        """test packages action with known bad from param"""
+        for from_value in [-1, 'one']:
+            query = {
+                'action': 'packages',
+                'index': 'bucket_packages',
+                'body': {'custom': 'body'},
+                'size': 42,
+                # this should barf
+                'from': from_value,
+                '_source': ['great', 'expectations']
+            }
+            # try a known bad query
+            event = self._make_event(query)
+            resp = lambda_handler(event, None)
+            assert resp['statusCode'] == 500
+            assert 'int' in resp['body']
+
+    @patch.dict(os.environ, {'MAX_DOCUMENTS_PER_SHARD': '538'})
+    def test_search(self):
+        """test standard search function"""
+        url = 'https://www.example.com:443/bucket/_search?' + urlencode({
+            'size': 1000,
+            'from': 0,
+            '_source': ','.join([
+                'key',
+                'version_id',
+                'updated',
+                'last_modified',
+                'size',
+                'user_meta',
+                'comment',
+                'handle',
+                'hash',
+                'tags',
+                'metadata',
+                'pointer_file',
+                'delete_marker',
+            ]),
+            'terminate_after': 538,
+        })
+
+        def _callback(request):
+            payload = json.loads(request.body)
+            assert payload['query']
+            assert payload['query']['query_string']
+            assert payload['query']['query_string']['fields']
+            assert payload['query']['query_string']['query']
+
+            return 200, {}, json.dumps({'results': 'blah'})
+
+        self.requests_mock.add_callback(
+            responses.GET,
+            url,
+            callback=_callback,
+            content_type='application/json',
+            match_querystring=True,
         )
 
         query = {
@@ -271,23 +347,83 @@ class TestSearch(TestCase):
         assert resp['statusCode'] == 200
         assert json.loads(resp['body']) == {'results': 'blah'}
 
+    def test_search_retry(self):
+        """test standard search function"""
+        url = 'https://www.example.com:443/bucket/_search?' + urlencode({
+            'size': 1000,
+            'from': 0,
+            '_source': ','.join([
+                'key',
+                'version_id',
+                'updated',
+                'last_modified',
+                'size',
+                'user_meta',
+                'comment',
+                'handle',
+                'hash',
+                'tags',
+                'metadata',
+                'pointer_file',
+                'delete_marker',
+            ]),
+            'terminate_after': 10000,
+        })
+
+        def _callback(request):
+            payload = json.loads(request.body)
+            assert payload['query']
+            if retry < 2:
+                assert payload['query']['query_string']
+                assert payload['query']['query_string']['fields']
+                assert payload['query']['query_string']['query']
+            else:
+                assert payload['query']['simple_query_string']
+
+            return 200, {}, json.dumps({'results': 'blah'})
+
+        self.requests_mock.add_callback(
+            responses.GET,
+            url,
+            callback=_callback,
+            content_type='application/json',
+            match_querystring=True,
+        )
+
+        for retry in [0, 1, 2, 3]:
+
+            query = {
+                'action': 'search',
+                'index': 'bucket',
+                'query': '123',
+                'retry': retry,
+            }
+
+            event = self._make_event(query)
+            resp = lambda_handler(event, None)
+            assert resp['statusCode'] == 200
+            assert json.loads(resp['body']) == {'results': 'blah'}
+
     def test_stats(self):
-        url = 'https://www.example.com:443/bucket/_search?' + urlencode(dict(
-            _source='false',  # must match JSON; False will fail match_querystring
-            size=0,
-            timeout='15s'
-        ))
+        """test overview statistics"""
+        url = 'https://www.example.com:443/bucket/_search?' + urlencode({
+            '_source': 'false',  # must match JSON; False will fail match_querystring
+            'size': 0,
+            'from': 0,
+        })
 
         def _callback(request):
             payload = json.loads(request.body)
             assert payload == {
-                "query": {"match_all": {}},
+                "query": {"term": {"delete_marker": False}},
                 "aggs": {
-                    "totalBytes": {"sum": {"field": "size"}},
+                    "totalBytes": {"sum": {"field": 'size'}},
                     "exts": {
                         "terms": {"field": 'ext'},
-                        "aggs": {"size": {"sum": {"field": "size"}}},
+                        "aggs": {"size": {"sum": {"field": 'size'}}},
                     },
+                    # TODO: move this to a separate action (pkg_stats)
+                    "totalPackageHandles": {"value_count": {"field": "handle"}},
                 }
             }
             # use 'all_gz' since it's not altered by the handler

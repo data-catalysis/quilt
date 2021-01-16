@@ -1,3 +1,4 @@
+import cx from 'classnames'
 import * as R from 'ramda'
 import * as React from 'react'
 import AutosizeInput from 'react-input-autosize'
@@ -9,6 +10,8 @@ import { readableBytes } from 'utils/string'
 import tagged from 'utils/tagged'
 import useDebouncedInput from 'utils/useDebouncedInput'
 import usePrevious from 'utils/usePrevious'
+
+const EMPTY = <i>{'<EMPTY>'}</i>
 
 function WrappedAutosizeInput({ className, ...props }) {
   return <AutosizeInput inputClassName={className} {...props} />
@@ -33,6 +36,9 @@ const useItemStyles = M.makeStyles((t) => ({
     alignItems: 'center',
     display: 'flex',
   },
+  archived: {
+    opacity: 0.5,
+  },
   info: {
     display: 'flex',
   },
@@ -42,15 +48,21 @@ const useItemStyles = M.makeStyles((t) => ({
   },
 }))
 
-function Item({ name, to, icon, children, ...props }) {
+function Item({ name, to, icon, children, archived, ...props }) {
   const classes = useItemStyles()
   return (
-    <M.ListItem component={Link} to={to} className={classes.root} {...props}>
-      <div className={classes.name}>
+    <M.ListItem
+      component={Link}
+      to={to}
+      className={classes.root}
+      title={archived ? 'Object archived' : undefined}
+      {...props}
+    >
+      <div className={cx(classes.name, archived && classes.archived)}>
         {!!icon && <M.Icon className={classes.icon}>{icon}</M.Icon>}
         {name}
       </div>
-      <div className={classes.info}>{children}</div>
+      <div className={cx(classes.info, archived && classes.archived)}>{children}</div>
     </M.ListItem>
   )
 }
@@ -73,7 +85,7 @@ const computeStats = R.reduce(
   },
 )
 
-const useStatsStyles = M.makeStyles((t) => ({
+const useHeaderStyles = M.makeStyles((t) => ({
   root: {
     alignItems: 'center',
     borderBottom: `1px solid ${t.palette.divider}`,
@@ -96,16 +108,25 @@ const useStatsStyles = M.makeStyles((t) => ({
   checkboxLabel: {
     ...t.typography.body2,
   },
-  clear: {
+  btn: {
     fontSize: 11,
     lineHeight: '22px',
+    minWidth: 'auto',
     paddingBottom: 0,
     paddingTop: 2,
+  },
+  btnMargin: {
+    marginLeft: t.spacing(0.75),
   },
   clearIcon: {
     fontSize: '16px !important',
     lineHeight: '15px',
     marginLeft: -4,
+  },
+  clearIconText: {
+    fontSize: '16px !important',
+    lineHeight: '15px',
+    marginLeft: -6,
   },
   searchIcon: {
     fontSize: 20,
@@ -126,8 +147,109 @@ const useStatsStyles = M.makeStyles((t) => ({
   },
 }))
 
-function Stats({ items, unfiltered, filtering, truncated, useRE, setUseRE }) {
-  const classes = useStatsStyles()
+function HeaderWithPrefixFiltering({ items, truncated, prefix, setPrefix }) {
+  const classes = useHeaderStyles()
+  const stats = React.useMemo(() => computeStats(items), [items])
+  const inputRef = React.useRef()
+  const [prefixValue, setPrefixValue] = React.useState(prefix)
+
+  const blur = React.useCallback(() => {
+    if (inputRef.current && inputRef.current.blur) inputRef.current.blur()
+  }, [inputRef])
+
+  const apply = React.useCallback(() => {
+    if (prefix === prefixValue) return
+    setPrefix(prefixValue)
+  }, [prefix, prefixValue, setPrefix])
+
+  const clear = React.useCallback(() => {
+    if (prefixValue) setPrefixValue('')
+    if (prefix) setPrefix('')
+  }, [prefix, prefixValue, setPrefix, setPrefixValue])
+
+  const handleKeyDown = React.useCallback(
+    (e) => {
+      if (e.key === 'Escape') {
+        clear()
+        blur()
+      } else if (e.key === 'Enter') {
+        apply()
+        blur()
+      }
+    },
+    [blur, apply, clear],
+  )
+
+  const handleChange = React.useCallback(
+    (e) => {
+      setPrefixValue(e.target.value)
+    },
+    [setPrefixValue],
+  )
+
+  return (
+    <div className={classes.root}>
+      <M.InputBase
+        value={prefixValue}
+        onChange={handleChange}
+        onKeyDown={handleKeyDown}
+        placeholder="Filter current directory by prefix"
+        classes={{ input: classes.input }}
+        inputComponent={WrappedAutosizeInput}
+        inputRef={inputRef}
+        startAdornment={<M.Icon className={classes.searchIcon}>search</M.Icon>}
+        endAdornment={
+          <>
+            <M.Button
+              className={cx(classes.btn, classes.btnMargin)}
+              size="small"
+              variant="contained"
+              color="primary"
+              onClick={apply}
+            >
+              Filter
+            </M.Button>
+            {(!!prefixValue || !!prefix) && (
+              <M.Button
+                className={cx(classes.btn, classes.btnMargin)}
+                size="small"
+                variant="text"
+                color="primary"
+                onClick={clear}
+                endIcon={<M.Icon className={classes.clearIconText}>clear</M.Icon>}
+              >
+                Clear
+              </M.Button>
+            )}
+          </>
+        }
+      />
+      <span className={classes.spacer} />
+      <span>{stats.dirs} folders</span>
+      <span className={classes.divider}> | </span>
+      <span>{stats.files} files</span>
+      <span className={classes.divider}> | </span>
+      <span>{readableBytes(stats.size)}</span>
+      {truncated && <span className={classes.truncated}>(truncated)</span>}
+      {!!stats.modified && (
+        <>
+          <span className={classes.divider}> | </span>
+          <span>Last modified {stats.modified.toLocaleString()}</span>
+        </>
+      )}
+    </div>
+  )
+}
+
+function HeaderWithLocalFiltering({
+  items,
+  unfiltered,
+  filtering,
+  truncated,
+  useRE,
+  setUseRE,
+}) {
+  const classes = useHeaderStyles()
   const stats = React.useMemo(() => computeStats(unfiltered), [unfiltered])
   const filteredStats = React.useMemo(() => computeStats(items), [items])
   const inputRef = React.useRef()
@@ -138,6 +260,7 @@ function Stats({ items, unfiltered, filtering, truncated, useRE, setUseRE }) {
         if (inputRef.current && inputRef.current.blur) inputRef.current.blur()
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [filtering.set, inputRef],
   )
   const handleToggleRE = React.useCallback(
@@ -175,7 +298,7 @@ function Stats({ items, unfiltered, filtering, truncated, useRE, setUseRE }) {
             />
             {!!filtering.input.value && (
               <M.Button
-                className={classes.clear}
+                className={classes.btn}
                 size="small"
                 variant="contained"
                 color="primary"
@@ -252,16 +375,124 @@ const useListingStyles = M.makeStyles((t) => ({
   },
 }))
 
-export default function Listing({ items, truncated = false, locked = false, loadMore }) {
+export function ListingWithPrefixFiltering({
+  items,
+  truncated = false,
+  locked = false,
+  prefix = '',
+  setPrefix,
+  bucket,
+  path,
+}) {
   const classes = useListingStyles()
 
   const scrollRef = React.useRef(null)
-  const scroll = React.useCallback((prev) => {
-    if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
-  })
+  const scroll = React.useCallback(
+    (prev) => {
+      if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
+    },
+    [scrollRef],
+  )
+
+  const totalItems = React.useMemo(() => {
+    const stats = computeStats(items)
+    return stats.dirs + stats.files
+  }, [items])
+
+  const pagination = Pagination.use(items, { perPage: 25, onChange: scroll })
+
+  return (
+    <M.Card>
+      <M.CardContent className={classes.root}>
+        {locked && (
+          <div className={classes.lock}>
+            <M.CircularProgress />
+          </div>
+        )}
+        {!items.length && !prefix ? (
+          <M.Typography className={classes.empty} variant="h5">
+            No files
+          </M.Typography>
+        ) : (
+          <>
+            <HeaderWithPrefixFiltering
+              key={`${bucket}/${path}`}
+              {...{ items, truncated, prefix, setPrefix }}
+            />
+            <div ref={scrollRef} />
+            {!items.length && (
+              <div className={classes.noMatch}>
+                No entries starting with{' '}
+                <b>
+                  <code>{`"${prefix}"`}</code>
+                </b>
+              </div>
+            )}
+            {pagination.paginated.map(
+              ListingItem.case({
+                Dir: ({ name, to }) => (
+                  <Item icon="folder_open" key={name} name={name || EMPTY} to={to} />
+                ),
+                File: ({ name, to, size, modified, archived }) => (
+                  <Item
+                    icon="insert_drive_file"
+                    key={name}
+                    name={name}
+                    to={to}
+                    archived={archived}
+                  >
+                    <div className={classes.size}>{readableBytes(size)}</div>
+                    {!!modified && (
+                      <div className={classes.modified}>{modified.toLocaleString()}</div>
+                    )}
+                  </Item>
+                ),
+              }),
+            )}
+            {(truncated || pagination.pages > 1) && (
+              <M.Box>
+                <M.Divider />
+                <M.Box display="flex" alignItems="center" minHeight={36} px={1}>
+                  {truncated && (
+                    <M.Typography variant="body2" component="span" color="textSecondary">
+                      <M.Icon
+                        style={{
+                          fontSize: 16,
+                          verticalAlign: 'text-bottom',
+                          marginRight: 4,
+                        }}
+                      >
+                        warning
+                      </M.Icon>
+                      Results truncated to {totalItems} items
+                    </M.Typography>
+                  )}
+                  <M.Box flexGrow={1} />
+                  {pagination.pages > 1 && <Pagination.Controls {...pagination} />}
+                </M.Box>
+              </M.Box>
+            )}
+          </>
+        )}
+      </M.CardContent>
+    </M.Card>
+  )
+}
+
+export function ListingWithLocalFiltering({ items, truncated = false, locked = false }) {
+  const classes = useListingStyles()
+
+  const scrollRef = React.useRef(null)
+  const scroll = React.useCallback(
+    (prev) => {
+      if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
+    },
+    [scrollRef],
+  )
 
   const [useRE, setUseRE] = React.useState(true)
   const filtering = useDebouncedInput('', 200)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   const filtered = React.useMemo(
     R.tryCatch(
       R.pipe(
@@ -314,7 +545,7 @@ export default function Listing({ items, truncated = false, locked = false, load
           </M.Typography>
         ) : (
           <>
-            <Stats
+            <HeaderWithLocalFiltering
               items={filtered.result}
               unfiltered={items}
               filtering={filtering}
@@ -334,18 +565,21 @@ export default function Listing({ items, truncated = false, locked = false, load
                       {useRE ? `/${filtering.value}/i` : `"${filtering.value}"`}
                     </code>
                   </b>
-                  {truncated && !!loadMore && (
-                    <> &rarr; try loading more items (button below)</>
-                  )}
                 </div>
               ))}
             {pagination.paginated.map(
               ListingItem.case({
                 Dir: ({ name, to }) => (
-                  <Item icon="folder_open" key={name} name={name} to={to} />
+                  <Item icon="folder_open" key={name} name={name || EMPTY} to={to} />
                 ),
-                File: ({ name, to, size, modified }) => (
-                  <Item icon="insert_drive_file" key={name} name={name} to={to}>
+                File: ({ name, to, size, modified, archived }) => (
+                  <Item
+                    icon="insert_drive_file"
+                    key={name}
+                    name={name}
+                    to={to}
+                    archived={archived}
+                  >
                     <div className={classes.size}>{readableBytes(size)}</div>
                     {!!modified && (
                       <div className={classes.modified}>{modified.toLocaleString()}</div>
@@ -370,19 +604,6 @@ export default function Listing({ items, truncated = false, locked = false, load
                         warning
                       </M.Icon>
                       Results truncated to {totalItems} items
-                      {!!loadMore && (
-                        <>
-                          <> &rarr; </>
-                          <M.Link
-                            onClick={loadMore}
-                            component="button"
-                            underline="always"
-                            style={{ verticalAlign: 'baseline' }}
-                          >
-                            load more
-                          </M.Link>
-                        </>
-                      )}
                     </M.Typography>
                   )}
                   <M.Box flexGrow={1} />

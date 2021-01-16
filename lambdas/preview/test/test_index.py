@@ -2,9 +2,10 @@
 Test functions for preview endpoint
 """
 import json
+import math
 import os
-import pathlib
 import re
+from pathlib import Path
 from unittest.mock import ANY, patch
 
 import pyarrow.parquet as pq
@@ -16,7 +17,8 @@ from .. import index
 
 MOCK_ORIGIN = 'http://localhost:3000'
 
-BASE_DIR = pathlib.Path(__file__).parent / 'data'
+
+BASE_DIR = Path(__file__).parent / 'data'
 
 
 # pylint: disable=no-member,invalid-sequence-index
@@ -38,6 +40,78 @@ class TestIndex():
             'body': None,
             'isBase64Encoded': False,
         }
+
+    @responses.activate
+    def test_403(self):
+        """test 403 cases, such as Glacier"""
+        url = self.FILE_URL
+        responses.add(
+            responses.GET,
+            url=url,
+            status=403,
+        )
+        event = self._make_event({'url': url, 'input': 'txt'})
+        response = index.lambda_handler(event, None)
+        assert response["statusCode"] == 403
+        body = json.loads(response["body"])
+        assert "text" in body
+        assert "error" in body
+
+    @responses.activate
+    def test_fcs(self):
+        """test fcs extraction
+        for extended testing you can download FCS files here
+        https://flowrepository.org/experiments/4/download_ziped_files,
+        copy to data/fcs/ and run this unit test
+        """
+        parent = BASE_DIR / "fcs"
+        fcs_files = list(parent.glob("*.fcs"))
+        extended = False
+        if (
+                set(os.path.split(f)[1] for f in fcs_files)
+                != set(['accuri-ao1.fcs', 'bad.fcs', '3215apc 100004.fcs'])
+         ):
+            extended = True
+        first = True
+        for fcs in fcs_files:
+            _, name = os.path.split(fcs)
+            file_bytes = fcs.read_bytes()
+            if first:
+                responses.add(
+                    responses.GET,
+                    self.FILE_URL,
+                    body=file_bytes,
+                    status=200,
+                )
+                first = False
+            else:
+                responses.replace(
+                    responses.GET,
+                    self.FILE_URL,
+                    body=file_bytes,
+                    status=200,
+                )
+
+            event = self._make_event({'url': self.FILE_URL, 'input': 'fcs'})
+            resp = index.lambda_handler(event, None)
+            assert resp['statusCode'] == 200, f'Expected 200, got {resp["statusCode"]}'
+            body = json.loads(read_body(resp))
+            assert 'info' in body
+            if 'warnings' not in body['info']:
+                if not extended:
+                    assert name == 'accuri-ao1.fcs'
+                assert body['html'].startswith('<div>')
+                assert body['html'].endswith('</div>')
+                assert body['info']['metadata'].keys()
+            else:
+                assert not body['html']
+                if 'metadata' not in body['info']:
+                    assert body['info']['warnings'].startswith('Unable')
+                    if not extended:
+                        assert name == 'bad.fcs'
+                else:
+                    if not extended:
+                        assert name == '3215apc 100004.fcs'
 
     def test_bad(self):
         """send a known bad event (no input query parameter)"""
@@ -167,6 +241,25 @@ class TestIndex():
             '<span class="n">batch_size</span><span class="o">=</span><span class="mi">100</span>'
             '<span class="p">'
         ) in body_html, 'Last cell output missing'
+
+    @patch(__name__ + '.index.LAMBDA_MAX_OUT', 89_322)
+    @responses.activate
+    def test_ipynb_chop(self):
+        """test that we eliminate output cells when we're in danger of breaking
+        Lambda's invocation limit"""
+        notebook = BASE_DIR / 'nb_1200727.ipynb'
+        responses.add(
+            responses.GET,
+            self.FILE_URL,
+            body=notebook.read_bytes(),
+            status=200)
+        event = self._make_event({'url': self.FILE_URL, 'input': 'ipynb'})
+        resp = index.lambda_handler(event, None)
+        body = json.loads(read_body(resp))
+        assert resp['statusCode'] == 200, 'preview failed on nb_1200727.ipynb'
+        body_html = body['html']
+        # isclose bc string sizes differ, e.g. on Linux
+        assert math.isclose(len(body_html), 18084, abs_tol=200), "Hmm, didn't chop nb_1200727.ipynb"
 
     @responses.activate
     def test_ipynb_exclude(self):

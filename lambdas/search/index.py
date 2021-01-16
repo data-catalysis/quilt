@@ -3,8 +3,8 @@ Sends the request to ElasticSearch.
 
 TODO: Implement a higher-level search API.
 """
-from copy import deepcopy
 import os
+from copy import deepcopy
 from itertools import filterfalse, tee
 
 from aws_requests_auth.boto_utils import BotoAWSRequestsAuth
@@ -13,32 +13,13 @@ from elasticsearch import Elasticsearch, RequestsHttpConnection
 from t4_lambda_shared.decorator import api
 from t4_lambda_shared.utils import get_default_origins, make_json_response
 
-MAX_QUERY_DURATION = '15s'
+DEFAULT_SIZE = 1_000
+MAX_QUERY_DURATION = 27  # Just shy of 29s API Gateway limit
 NUM_PREVIEW_IMAGES = 100
 NUM_PREVIEW_FILES = 20
 COMPRESSION_EXTS = ['.gz']
-IMG_EXTS = [
-    '.jpg',
-    '.jpeg',
-    '.png',
-    '.gif',
-    '.webp',
-    '.bmp',
-    '.tiff',
-    '.tif',
-]
-SAMPLE_EXTS = [
-    '.parquet',
-    '.csv',
-    '.tsv',
-    '.txt',
-    '.vcf',
-    '.xls',
-    '.xlsx',
-    '.ipynb',
-    '.md',
-    '.json',
-]
+IMG_EXTS = r'.*\.(bmp|gif|jpg|jpeg|png|tif|tiff|webp)'
+SAMPLE_EXTS = r'.*\.(csv|ipynb|json|md|parquet|pdf|rmd|tsv|txt|vcf|xls|xlsx)(.gz)?'
 README_KEYS = ['README.md', 'README.txt', 'README.ipynb']
 SUMMARIZE_KEY = 'quilt_summarize.json'
 
@@ -50,31 +31,104 @@ def lambda_handler(request):
     """
 
     action = request.args.get('action')
-    indexes = request.args.get('index')
-    terminate_after = os.getenv('MAX_DOCUMENTS_PER_SHARD')
+    user_body = request.args.get('body', {})
+    user_fields = request.args.get('fields', [])
+    user_indexes = request.args.get('index', "")
+    user_size = request.args.get('size', DEFAULT_SIZE)
+    user_source = request.args.get('_source', [])
+    # 0-indexed starting position (for pagination)
+    user_from = int(request.args.get('from', 0))
+    user_retry = int(request.args.get('retry', 0))
+    terminate_after = int(os.environ.get('MAX_DOCUMENTS_PER_SHARD', 10_000))
 
-    if action == 'search':
+    if not user_indexes or not isinstance(user_indexes, str):
+        raise ValueError("Request must include index=<comma-separated string of indices>")
+
+    if user_from < 0:
+        raise ValueError("'from' must be a non-negative integer")
+
+    if action == 'packages':
         query = request.args.get('query', '')
-        body = {
+        body = user_body or {
             "query": {
-                "simple_query_string": {
+                "query_string": {
+                    "analyze_wildcard": True,
+                    "lenient": True,
                     "query": query,
-                    "fields": ['content', 'comment', 'key_text', 'meta_text']
+                    # see enterprise/**/bucket.py for mappings
+                    "fields": user_fields or [
+                        # package
+                        'comment', 'handle', 'handle_text^2', 'metadata', 'tags'
+                    ]
                 }
             }
         }
-        # TODO: should be user settable; we should proably forbid `content` (can be huge)
-        _source = ['key', 'version_id', 'updated', 'last_modified', 'size', 'user_meta']
-        size = 1000
+        if not all(i.endswith('_packages') for i in user_indexes.split(',')):
+            raise ValueError("'packages' action searching indexes that don't end in '_packages'")
+        _source = user_source
+        size = user_size
+        terminate_after = None
+    elif action == 'search':
+        query = request.args.get('query', '')
+        my_fields = user_fields or [
+            # object
+            'content', 'comment', 'ext', 'key', 'key_text', 'meta_text',
+            # package, and boost the fields
+            'handle^2', 'handle_text^2', 'metadata^2', 'tags^2'
+        ]
+        if user_retry <= 1:
+            body = {
+                "query": {
+                    "query_string": {
+                        "analyze_wildcard": True,
+                        "lenient": user_retry > 0,
+                        "query": query,
+                        # more precise searches vs OR
+                        "default_operator": "AND",
+                        # see enterprise/**/bucket.py for mappings
+                        "fields": my_fields
+                    }
+                }
+            }
+        else:
+            body = {
+                "query": {
+                    "simple_query_string": {
+                        "query": query,
+                        "analyze_wildcard": user_retry < 3,
+                        "default_operator": "AND",
+                        "fields": my_fields,
+                        "lenient": True,
+                    }
+                }
+            }
+        _source = user_source or [
+            'key',
+            'version_id',
+            'updated',
+            'last_modified',
+            'size',
+            'user_meta',
+            'comment',
+            'handle',
+            'hash',
+            'tags',
+            'metadata',
+            'pointer_file',
+            'delete_marker',
+        ]
+        size = DEFAULT_SIZE
     elif action == 'stats':
         body = {
-            "query": {"match_all": {}},
+            "query": {"term": {"delete_marker": False}},
             "aggs": {
                 "totalBytes": {"sum": {"field": 'size'}},
                 "exts": {
                     "terms": {"field": 'ext'},
                     "aggs": {"size": {"sum": {"field": 'size'}}},
                 },
+                # TODO: move this to a separate action (pkg_stats)
+                "totalPackageHandles": {"value_count": {"field": "handle"}},
             }
         }
         size = 0  # We still get all aggregates, just don't need the results
@@ -83,14 +137,14 @@ def lambda_handler(request):
         terminate_after = None
     elif action == 'images':
         body = {
-            'query': {'terms': {'ext': IMG_EXTS}},
+            'query': {'regexp': {'ext': IMG_EXTS}},
             'collapse': {
                 'field': 'key',
                 'inner_hits': {
                     'name': 'latest',
                     'size': 1,
                     'sort': [{'last_modified': 'desc'}],
-                    '_source': ['key', 'version_id'],
+                    '_source': ['key', 'version_id', 'delete_marker'],
                 },
             },
         }
@@ -100,7 +154,7 @@ def lambda_handler(request):
         body = {
             'query': {
                 'bool': {
-                    'must': [{'terms': {'ext': SAMPLE_EXTS}}],
+                    'must': [{'regexp': {'ext': SAMPLE_EXTS}}],
                     'must_not': [
                         {'terms': {'key': README_KEYS + [SUMMARIZE_KEY]}},
                         {'wildcard': {'key': '*/' + SUMMARIZE_KEY}},
@@ -113,7 +167,7 @@ def lambda_handler(request):
                     'name': 'latest',
                     'size': 1,
                     'sort': [{'last_modified': 'desc'}],
-                    '_source': ['key', 'version_id'],
+                    '_source': ['key', 'version_id', 'delete_marker'],
                 },
             },
         }
@@ -137,17 +191,19 @@ def lambda_handler(request):
         http_auth=auth,
         use_ssl=True,
         verify_certs=True,
-        connection_class=RequestsHttpConnection
+        connection_class=RequestsHttpConnection,
+        timeout=MAX_QUERY_DURATION,
     )
 
-    to_search = f"{indexes},{index_overrides}" if index_overrides else indexes
+    to_search = f"{user_indexes},{index_overrides}" if index_overrides else user_indexes
     result = es_client.search(
-        to_search,
-        body,
+        index=to_search,
+        body=body,
         _source=_source,
         size=size,
+        from_=user_from,
+        # try turning this off to consider all documents
         terminate_after=terminate_after,
-        timeout=MAX_QUERY_DURATION
     )
 
     return make_json_response(200, post_process(result, action))

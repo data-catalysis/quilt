@@ -1,32 +1,58 @@
-from collections import defaultdict, deque
-from codecs import iterdecode
-from concurrent.futures import ThreadPoolExecutor
-from enum import Enum
 import concurrent
 import functools
 import hashlib
+import itertools
+import logging
+import math
+import os
 import pathlib
+import queue
 import shutil
-from threading import Lock
-from typing import List
+import stat
+import threading
+import types
 import warnings
+from codecs import iterdecode
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+from threading import Lock
+from typing import List, Tuple
 
+import boto3
+import jsonlines
+from boto3.s3.transfer import TransferConfig
 from botocore import UNSIGNED
 from botocore.client import Config
-from botocore.exceptions import ClientError, ConnectionError, HTTPClientError, ReadTimeoutError
-import boto3
-from boto3.s3.transfer import TransferConfig
-from s3transfer.utils import ChunksizeAdjuster, OSUtils, signal_transferring, signal_not_transferring
-
-import jsonlines
-from tenacity import retry, retry_if_not_result, stop_after_attempt, wait_exponential, retry_if_result
+from botocore.exceptions import (
+    ClientError,
+    ConnectionError,
+    HTTPClientError,
+    ReadTimeoutError,
+)
+from s3transfer.utils import (
+    ChunksizeAdjuster,
+    OSUtils,
+    signal_not_transferring,
+    signal_transferring,
+)
+from tenacity import (
+    retry,
+    retry_if_not_result,
+    retry_if_result,
+    stop_after_attempt,
+    wait_exponential,
+)
 from tqdm import tqdm
 
 from .session import create_botocore_session
-from .util import PhysicalKey, QuiltException, DISABLE_TQDM
+from .util import DISABLE_TQDM, PhysicalKey, QuiltException
 
 MAX_COPY_FILE_LIST_RETRIES = 3
 MAX_FIX_HASH_RETRIES = 3
+
+
+logger = logging.getLogger(__name__)
 
 
 class S3Api(Enum):
@@ -142,20 +168,22 @@ class S3ClientProvider:
                 event_name, signal_transferring,
                 unique_id='datatransfer-transferring')
 
+    def _build_client(self, get_config):
+        session = self.get_boto_session()
+        return session.client('s3', config=get_config(session))
+
     def _build_standard_client(self):
-        boto_session = self.get_boto_session()
-
-        config = None
-        if boto_session.get_credentials() is None:
-            config = Config(signature_version=UNSIGNED)
-
-        s3_client = boto_session.client('s3', config=config)
+        s3_client = self._build_client(
+            lambda session:
+                Config(signature_version=UNSIGNED)
+                if session.get_credentials() is None
+                else None
+        )
         self.register_signals(s3_client)
         self._standard_client = s3_client
 
     def _build_unsigned_client(self):
-        boto_session = self.get_boto_session()
-        s3_client = boto_session.client('s3', config=Config(signature_version=UNSIGNED))
+        s3_client = self._build_client(lambda session: Config(signature_version=UNSIGNED))
         self.register_signals(s3_client)
         self._unsigned_client = s3_client
 
@@ -208,6 +236,11 @@ def check_head_object_works_for_client(s3_client, params):
 
 
 s3_transfer_config = TransferConfig()
+
+
+def read_file_chunks(file, chunksize=s3_transfer_config.io_chunksize):
+    return itertools.takewhile(bool, map(file.read, itertools.repeat(chunksize)))
+
 
 # When uploading files at least this size, compare the ETags first and skip the upload if they're equal;
 # copy the remote file onto itself if the metadata changes.
@@ -285,7 +318,7 @@ def _upload_file(ctx, size, src_path, dest_bucket, dest_key):
             ctx.run(upload_part, i, start, end)
 
 
-def _download_file(ctx, src_bucket, src_key, src_version, dest_path):
+def _download_file(ctx, size, src_bucket, src_key, src_version, dest_path):
     dest_file = pathlib.Path(dest_path)
     if dest_file.is_reserved():
         raise ValueError("Cannot download to %r: reserved file name" % dest_path)
@@ -295,20 +328,64 @@ def _download_file(ctx, src_bucket, src_key, src_version, dest_path):
 
     dest_file.parent.mkdir(parents=True, exist_ok=True)
 
+    with dest_file.open('wb') as f:
+        fileno = f.fileno()
+        is_regular_file = stat.S_ISREG(os.stat(fileno).st_mode)
+
+        # TODO: To enable this we need to fix some tests in test_packages,
+        #       that setup mocked responses to return less data than expected/specified in the manifest.
+        # if is_regular_file:
+        #     # Preallocate file.
+        #     if hasattr(os, 'posix_fallocate'):
+        #         os.posix_fallocate(fileno, 0, size)
+        #     else:
+        #         f.truncate(size)
+
     if src_version is not None:
-        params.update(dict(VersionId=src_version))
-    resp = s3_client.get_object(**params)
+        params.update(VersionId=src_version)
 
-    body = resp['Body']
-    with open(dest_path, 'wb') as fd:
-        while True:
-            chunk = body.read(64 * 1024)
-            if not chunk:
-                break
-            fd.write(chunk)
-            ctx.progress(len(chunk))
+    part_size = s3_transfer_config.multipart_chunksize
+    is_multi_part = (
+        is_regular_file
+        and size >= s3_transfer_config.multipart_threshold
+        and size > part_size
+    )
+    part_numbers = (
+        range(math.ceil(size / part_size))
+        if is_multi_part else
+        (None,)
+    )
+    remaining_counter = len(part_numbers)
+    remaining_counter_lock = Lock()
 
-    ctx.done(PhysicalKey.from_path(dest_path))
+    def download_part(part_number):
+        nonlocal remaining_counter
+
+        with dest_file.open('r+b') as chunk_f:
+            if part_number is not None:
+                start = part_number * part_size
+                end = min(start + part_size, size) - 1
+                part_params = dict(params, Range=f'bytes={start}-{end}')
+                chunk_f.seek(start)
+            else:
+                part_params = params
+
+            resp = s3_client.get_object(**part_params)
+            body = resp['Body']
+            while True:
+                chunk = body.read(s3_transfer_config.io_chunksize)
+                if not chunk:
+                    break
+                ctx.progress(chunk_f.write(chunk))
+
+        with remaining_counter_lock:
+            remaining_counter -= 1
+            done = remaining_counter == 0
+        if done:
+            ctx.done(PhysicalKey.from_path(dest_path))
+
+    for part_number in part_numbers:
+        ctx.run(download_part, part_number)
 
 
 def _copy_remote_file(ctx, size, src_bucket, src_key, src_version,
@@ -506,7 +583,7 @@ def _copy_file_list_internal(file_list, results, message, callback, exceptions_t
                     _upload_or_copy_file(ctx, size, src.path, dest.bucket, dest.path)
             else:
                 if dest.is_local():
-                    _download_file(ctx, src.bucket, src.path, src.version_id, dest.path)
+                    _download_file(ctx, size, src.bucket, src.path, src.version_id, dest.path)
                 else:
                     _copy_remote_file(ctx, size, src.bucket, src.path, src.version_id,
                                       dest.bucket, dest.path)
@@ -562,10 +639,7 @@ def _calculate_etag(file_path):
             chunksize = adjuster.adjust_chunksize(s3_transfer_config.multipart_chunksize, size)
 
             hashes = []
-            while True:
-                contents = fd.read(chunksize)
-                if not contents:
-                    break
+            for contents in read_file_chunks(fd, chunksize):
                 hashes.append(hashlib.md5(contents).digest())
             etag = '%s-%d' % (hashlib.md5(b''.join(hashes)).hexdigest(), len(hashes))
     return '"%s"' % etag
@@ -588,7 +662,7 @@ def list_object_versions(bucket, prefix, recursive=True):
     )
     if not recursive:
         # Treat '/' as a directory separator and only return one level of files instead of everything.
-        list_obj_params.update(dict(Delimiter='/'))
+        list_obj_params.update(Delimiter='/')
 
     # TODO: make this a generator?
     versions = []
@@ -619,7 +693,7 @@ def list_objects(bucket, prefix, recursive=True):
                            Prefix=prefix)
     if not recursive:
         # Treat '/' as a directory separator and only return one level of files instead of everything.
-        list_obj_params.update(dict(Delimiter='/'))
+        list_obj_params.update(Delimiter='/')
 
     s3_client = S3ClientProvider().find_correct_client(S3Api.LIST_OBJECTS_V2, bucket, list_obj_params)
     paginator = s3_client.get_paginator('list_objects_v2')
@@ -757,18 +831,31 @@ def put_bytes(data: bytes, dest: PhysicalKey):
         )
 
 
+def _local_get_bytes(pk: PhysicalKey):
+    return pathlib.Path(pk.path).read_bytes()
+
+
+def _s3_query_object(pk: PhysicalKey, *, head=False):
+    params = dict(Bucket=pk.bucket, Key=pk.path)
+    if pk.version_id is not None:
+        params.update(VersionId=pk.version_id)
+    s3_client = S3ClientProvider().find_correct_client(
+        S3Api.HEAD_OBJECT if head else S3Api.GET_OBJECT, pk.bucket, params)
+    return (s3_client.head_object if head else s3_client.get_object)(**params)
+
+
 def get_bytes(src: PhysicalKey):
     if src.is_local():
-        src_file = pathlib.Path(src.path)
-        data = src_file.read_bytes()
-    else:
-        params = dict(Bucket=src.bucket, Key=src.path)
-        if src.version_id is not None:
-            params.update(dict(VersionId=src.version_id))
-        s3_client = S3ClientProvider().find_correct_client(S3Api.GET_OBJECT, src.bucket, params)
-        resp = s3_client.get_object(**params)
-        data = resp['Body'].read()
-    return data
+        return _local_get_bytes(src)
+    return _s3_query_object(src)['Body'].read()
+
+
+def get_bytes_and_effective_pk(src: PhysicalKey) -> Tuple[bytes, PhysicalKey]:
+    if src.is_local():
+        return _local_get_bytes(src), src
+
+    resp = _s3_query_object(src)
+    return resp['Body'].read(), PhysicalKey(src.bucket, src.path, resp.get('VersionId'))
 
 
 def get_size_and_version(src: PhysicalKey):
@@ -788,14 +875,7 @@ def get_size_and_version(src: PhysicalKey):
             raise QuiltException("Not a file: %r" % str(src_file))
         size = src_file.stat().st_size
     else:
-        params = dict(
-            Bucket=src.bucket,
-            Key=src.path
-        )
-        if src.version_id is not None:
-            params.update(dict(VersionId=src.version_id))
-        s3_client = S3ClientProvider().find_correct_client(S3Api.HEAD_OBJECT, src.bucket, params)
-        resp = s3_client.head_object(**params)
+        resp = _s3_query_object(src, head=True)
         size = resp['ContentLength']
         version = resp.get('VersionId')
     return size, version
@@ -809,6 +889,89 @@ def calculate_sha256(src_list: List[PhysicalKey], sizes: List[int]):
     return _calculate_sha256_internal(src_list, sizes, [None] * len(src_list))
 
 
+def _calculate_hash_get_s3_chunks(ctx, src, size):
+    params = dict(Bucket=src.bucket, Key=src.path)
+    if src.version_id is not None:
+        params.update(VersionId=src.version_id)
+    part_size = s3_transfer_config.multipart_chunksize
+    is_multi_part = (
+        size >= s3_transfer_config.multipart_threshold
+        and size > part_size
+    )
+    part_numbers = (
+        range(math.ceil(size / part_size))
+        if is_multi_part else
+        (None,)
+    )
+    s3_client = ctx.find_correct_client(S3Api.GET_OBJECT, src.bucket, params)
+
+    def read_to_queue(part_number, put_to_queue, stopped_event):
+        try:
+            logger.debug('%r part %s: download enqueued', src, part_number)
+            # This semaphore is released in iter_queue() when the part is fully
+            # downloaded and all chunks are retrieved from the queue or if download
+            # fails.
+            ctx.pending_parts_semaphore.acquire()
+            logger.debug('%r part %s: download started', src, part_number)
+            if part_number is not None:
+                start = part_number * part_size
+                end = min(start + part_size, size) - 1
+                part_params = dict(params, Range=f'bytes={start}-{end}')
+            else:
+                part_params = params
+
+            body = s3_client.get_object(**part_params)['Body']
+            for chunk in read_file_chunks(body):
+                put_to_queue(chunk)
+                if stopped_event.is_set():
+                    logger.debug('%r part %s: stopped', src, part_number)
+                    break
+
+            logger.debug('%r part %s: downloaded', src, part_number)
+        finally:
+            put_to_queue(None)
+
+    def iter_queue(part_number):
+        q = queue.Queue()
+        stopped_event = threading.Event()
+        f = ctx.executor.submit(read_to_queue, part_number, q.put_nowait, stopped_event)
+        try:
+            yield
+            yield from iter(q.get, None)
+        except GeneratorExit:
+            if f.cancel():
+                logger.debug('%r part %s: cancelled', src, part_number)
+            else:
+                stopped_event.set()
+        else:
+            f.result()  # Propagate exception from read_to_queue() if any.
+            logger.debug('%r part %s: processed', src, part_number)
+        finally:
+            if not f.cancelled():
+                ctx.pending_parts_semaphore.release()
+                logger.debug('%r part %s: semaphore released', src, part_number)
+
+    generators = deque()
+    for gen in map(iter_queue, part_numbers):
+        # Step into generator, so it will receive GeneratorExit when it's closed
+        # or garbage collected.
+        next(gen)
+        generators.append(gen)
+
+    return itertools.chain.from_iterable(
+        itertools.starmap(generators.popleft, itertools.repeat((), len(part_numbers))))
+
+
+def with_lock(f):
+    lock = threading.Lock()
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        with lock:
+            return f(*args, **kwargs)
+    return wrapper
+
+
 @retry(stop=stop_after_attempt(MAX_FIX_HASH_RETRIES),
        wait=wait_exponential(multiplier=1, min=1, max=10),
        retry=retry_if_result(lambda results: any(r is None or isinstance(r, Exception) for r in results)),
@@ -820,56 +983,77 @@ def _calculate_sha256_internal(src_list, sizes, results):
         for size, result in zip(sizes, results)
         if result is None or isinstance(result, Exception)
     )
-    lock = Lock()
+    # This controls how many parts can be stored in the memory.
+    # This includes the ones that are being downloaded or hashed.
+    # The number was chosen empirically.
+    s3_max_pending_parts = s3_transfer_config.max_request_concurrency * 4
+    stopped = False
 
-    with tqdm(desc="Hashing", total=total_size, unit='B', unit_scale=True, disable=DISABLE_TQDM) as progress:
-        def _process_url(src, size):
-            hash_obj = hashlib.sha256()
-            if src.is_local():
-                with open(src.path, 'rb') as fd:
-                    while True:
-                        chunk = fd.read(64 * 1024)
-                        if not chunk:
-                            break
-                        hash_obj.update(chunk)
-                        with lock:
-                            progress.update(len(chunk))
+    def get_file_chunks(src, size):
+        with open(src.path, 'rb') as file:
+            yield from read_file_chunks(file)
 
-                    current_file_size = fd.tell()
-                    if current_file_size != size:
-                        warnings.warn(
-                            f"Expected the package entry at {src!r} to be {size} B in size, but "
-                            f"found an object which is {current_file_size} B instead. This "
-                            f"indicates that the content of the file changed in between when you "
-                            f"included this  entry in the package (via set or set_dir) and now. "
-                            f"This should be avoided if possible."
-                        )
+            current_file_size = file.tell()
+            if current_file_size != size:
+                warnings.warn(
+                    f"Expected the package entry at {src!r} to be {size} B in size, but "
+                    f"found an object which is {current_file_size} B instead. This "
+                    f"indicates that the content of the file changed in between when you "
+                    f"included this  entry in the package (via set or set_dir) and now. "
+                    f"This should be avoided if possible."
+                )
 
-            else:
-                params = dict(Bucket=src.bucket, Key=src.path)
-                if src.version_id is not None:
-                    params.update(dict(VersionId=src.version_id))
-                try:
-                    s3_client = S3ClientProvider().find_correct_client(S3Api.GET_OBJECT, src.bucket, params)
+    def _process_url(src, size):
+        hash_obj = hashlib.sha256()
 
-                    resp = s3_client.get_object(**params)
-                    body = resp['Body']
-                    for chunk in body:
-                        hash_obj.update(chunk)
-                        with lock:
-                            progress.update(len(chunk))
-                except (ConnectionError, HTTPClientError, ReadTimeoutError) as e:
-                    return e
+        generator, exceptions_to_retry = (
+            (get_file_chunks(src, size), ())
+            if src.is_local() else
+            (
+                _calculate_hash_get_s3_chunks(s3_context, src, size),
+                (ConnectionError, HTTPClientError, ReadTimeoutError)
+            )
+        )
+        try:
+            for chunk in generator:
+                hash_obj.update(chunk)
+                progress_update(len(chunk))
+                if stopped:
+                    return
+        except exceptions_to_retry as e:
+            return e
+        else:
             return hash_obj.hexdigest()
+        finally:
+            # We want this generator to be finished immediately,
+            # so it finishes its own tasks.
+            del generator
 
-        with ThreadPoolExecutor() as executor:
-            future_to_idx = {
-                executor.submit(_process_url, src, size): i
-                for i, (src, size, result) in enumerate(zip(src_list, sizes, results))
-                if result is None or isinstance(result, Exception)
-            }
+    with tqdm(desc="Hashing", total=total_size, unit='B', unit_scale=True, disable=DISABLE_TQDM) as progress, \
+         ThreadPoolExecutor() as executor, \
+         ThreadPoolExecutor(
+             s3_transfer_config.max_request_concurrency,
+             thread_name_prefix='s3-executor',
+         ) as s3_executor:
+        s3_context = types.SimpleNamespace(
+            find_correct_client=with_lock(S3ClientProvider().find_correct_client),
+            pending_parts_semaphore=threading.BoundedSemaphore(s3_max_pending_parts),
+            executor=s3_executor,
+        )
+        progress_update = with_lock(progress.update)
+        future_to_idx = {
+            executor.submit(_process_url, src, size): i
+            for i, (src, size, result) in enumerate(zip(src_list, sizes, results))
+            if result is None or isinstance(result, Exception)
+        }
+        try:
             for future in concurrent.futures.as_completed(future_to_idx):
-                results[future_to_idx[future]] = future.result()
+                results[future_to_idx.pop(future)] = future.result()
+        finally:
+            stopped = True
+            while future_to_idx:
+                future, idx = future_to_idx.popitem()
+                future.cancel()
 
     return results
 
@@ -1044,7 +1228,8 @@ def select(src, query, meta=None, raw=False, **kwargs):
             reader = jsonlines.Reader(line.strip() for line in iter_lines(response, delimiter)
                                       if line.strip())
             # noinspection PyPackageRequirements
-            from pandas import DataFrame   # Lazy import for slow module
+            from pandas import DataFrame  # Lazy import for slow module
+
             # !! if this response type is modified, update related docstrings on Bucket.select().
             return DataFrame.from_records(x for x in reader)
         # If there's some need, we could implement some other OutputSerialization format here.

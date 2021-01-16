@@ -1,14 +1,42 @@
+import cx from 'classnames'
 import * as R from 'ramda'
 import * as React from 'react'
-import { Box, Icon } from '@material-ui/core'
-import { styled } from '@material-ui/styles'
+import * as M from '@material-ui/core'
 
-const IconBlank = () => <Box pr={2.5} />
-const IconExpand = () => <Icon fontSize="small">chevron_right</Icon>
-const IconCollapse = () => <Icon fontSize="small">expand_more</Icon>
+const useStyles = M.makeStyles((t) => ({
+  root: {
+    fontFamily: t.typography.monospace.fontFamily,
+    fontSize: t.typography.body2.fontSize,
+    overflow: 'auto',
+    whiteSpace: 'pre',
+    width: '100%',
+  },
+  more: {
+    color: t.palette.text.secondary,
+  },
+  flex: {
+    display: 'flex',
+  },
+  compoundInner: {
+    paddingLeft: t.spacing(2),
+  },
+  hidden: {
+    display: 'none',
+  },
+  iconBlank: {
+    paddingRight: t.spacing(2.5),
+  },
+  key: {
+    fontWeight: t.typography.fontWeightBold,
+  },
+}))
 
-function Key({ children, ...props }) {
-  return !!children && <Box {...props}>{children}: </Box>
+const IconBlank = ({ classes }) => <div className={classes.iconBlank} />
+const IconExpand = () => <M.Icon fontSize="small">chevron_right</M.Icon>
+const IconCollapse = () => <M.Icon fontSize="small">expand_more</M.Icon>
+
+function Key({ children, classes }) {
+  return !!children && <div className={classes.key}>{children}: </div>
 }
 
 const formatValue = R.cond([
@@ -16,57 +44,132 @@ const formatValue = R.cond([
   [R.T, (v) => `${v}`],
 ])
 
-// TODO: add some highlighting
-function PrimitiveValue({ children, ...props }) {
-  return <Box {...props}>{formatValue(children)}</Box>
-}
-
-function PrimitiveEntry({ name, value, topLevel = true, ...props }) {
+function PrimitiveEntry({ name, value, topLevel = true, classes }) {
   return (
-    <Box display="flex" alignItems="center" {...props}>
-      {!topLevel && <IconBlank />}
-      <Key>{name}</Key>
-      <PrimitiveValue>{value}</PrimitiveValue>
-    </Box>
+    <div className={classes.flex}>
+      {!topLevel && <IconBlank classes={classes} />}
+      <Key classes={classes}>{name}</Key>
+      <div>{formatValue(value)}</div>
+    </div>
   )
 }
 
-function CompoundEntry({ name, value, topLevel = true, ...props }) {
+const SEP = ', '
+const SEP_LEN = 2
+const MORE_LEN = 4
+const CHAR_W = 8.55
+
+function More({ keys, classes }) {
+  return (
+    <span className={classes.more}>
+      {'<'}&hellip;{keys}
+      {'>'}
+    </span>
+  )
+}
+
+const join = (s1, s2) =>
+  s1 ? (
+    <>
+      {s1}
+      {SEP}
+      {s2}
+    </>
+  ) : (
+    s2
+  )
+
+function CompoundEntry({
+  name,
+  value,
+  topLevel = true,
+  defaultExpanded = false,
+  showKeysWhenCollapsed,
+  classes,
+}) {
   const braces = Array.isArray(value) ? '[]' : '{}'
   const entries = React.useMemo(() => Object.entries(value), [value])
-  // TODO: default expanded state heuristics?
-  const [expanded, setExpanded] = React.useState(false)
+  const [stateExpanded, setExpanded] = React.useState(!!defaultExpanded)
   const toggle = React.useCallback(() => setExpanded((e) => !e), [])
   const empty = !entries.length
+  const expanded = !empty && stateExpanded
+
+  const renderCollapsed = () => {
+    const availableSpace =
+      showKeysWhenCollapsed -
+      R.sum([
+        SEP_LEN,
+        MORE_LEN,
+        20 / CHAR_W, // icon / padding
+        name ? name.length + 2 : 0,
+        4, // braces + spaces
+      ])
+    if (availableSpace <= 0 || Array.isArray(value)) {
+      return <More keys={entries.length} classes={classes} />
+    }
+    return entries.reduce(
+      (acc, [k]) => {
+        if (acc.done) return acc
+        return acc.availableSpace < k.length
+          ? {
+              str: join(
+                acc.str,
+                <More keys={entries.length - acc.keys} classes={classes} />,
+              ),
+              done: true,
+            }
+          : {
+              str: join(acc.str, <span className={classes.key}>{k}</span>),
+              availableSpace: acc.availableSpace - k.length - (acc.str ? SEP_LEN : 0),
+              keys: acc.keys + 1,
+              done: false,
+            }
+      },
+      { str: null, availableSpace, keys: 0, done: false },
+    ).str
+  }
 
   return (
-    <Box {...props}>
-      <Box display="flex" alignItems="center" onClick={toggle}>
+    <div>
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
+      <div className={classes.flex} onClick={toggle}>
         {/* TODO: use icon rotation like MUI ? */}
         {empty ? ( // eslint-disable-line no-nested-ternary
-          !topLevel && <IconBlank />
+          !topLevel && <IconBlank classes={classes} />
         ) : expanded ? (
           <IconCollapse />
         ) : (
           <IconExpand />
         )}
-        <Key>{name}</Key>
+        <Key classes={classes}>{name}</Key>
         {braces[0]}
         {!expanded && (
-          <span>
-            {empty ? '' : ` ${entries.length}`} {braces[1]}
-          </span>
+          <>
+            {empty ? '' : <span> {renderCollapsed()} </span>}
+            {braces[1]}
+          </>
         )}
-      </Box>
-      {!!expanded && (
-        <Box pl={2}>
-          {entries.map(([k, v]) => (
-            <JsonDisplayInner key={k} name={k} value={v} topLevel={false} />
-          ))}
-          <Box onClick={toggle}>{braces[1]}</Box>
-        </Box>
-      )}
-    </Box>
+      </div>
+      <div className={cx(classes.compoundInner, !expanded && classes.hidden)}>
+        {entries.map(([k, v]) => (
+          <JsonDisplayInner
+            classes={classes}
+            key={k}
+            name={k}
+            value={v}
+            topLevel={false}
+            defaultExpanded={
+              Number.isInteger(defaultExpanded) && defaultExpanded > 0
+                ? defaultExpanded - 1
+                : defaultExpanded
+            }
+            showKeysWhenCollapsed={showKeysWhenCollapsed - 20 / CHAR_W}
+          />
+        ))}
+        {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions, jsx-a11y/click-events-have-key-events */}
+        <div onClick={toggle}>{braces[1]}</div>
+      </div>
+    </div>
   )
 }
 
@@ -78,25 +181,47 @@ const isPrimitive = R.anyPass([
   R.equals(undefined),
 ])
 
-function JsonDisplayInner({ value, ...props }) {
-  const Component = isPrimitive(value) ? PrimitiveEntry : CompoundEntry
-  return <Component value={value} {...props} />
+function JsonDisplayInner(props) {
+  const Component = isPrimitive(props.value) ? PrimitiveEntry : CompoundEntry
+  return <Component {...props} />
 }
 
-const Container = styled(Box)({
-  overflow: 'auto',
-  whiteSpace: 'pre',
-})
+function useCurrentBreakpointWidth() {
+  const t = M.useTheme()
+  return ['sm', 'md', 'lg'].reduce(
+    // eslint-disable-next-line react-hooks/rules-of-hooks
+    (acc, b) => (M.useMediaQuery(t.breakpoints.up(b)) ? t.breakpoints.width(b) : acc),
+    320, // min supproted width
+  )
+}
 
-export default function JsonDisplay({ name, value, topLevel, ...props }) {
+export default function JsonDisplay({
+  name,
+  value,
+  topLevel,
+  // true (expand all) | false (collapse all) | int (expand N levels deep)
+  defaultExpanded,
+  // true (show all keys) | false (dont show keys, just show their number) | int (max length of keys string to show, incl. commas and stuff) | 'auto' (calculate string length based on screen size)
+  showKeysWhenCollapsed = 'auto',
+  className,
+  ...props
+}) {
+  const classes = useStyles()
+  const currentBPWidth = useCurrentBreakpointWidth()
+  const computedKeys = React.useMemo(() => {
+    if (showKeysWhenCollapsed === true) return Number.POSITIVE_INFINITY
+    if (showKeysWhenCollapsed === false) return Number.POSITIVE_INFINITY
+    // 80 is the usual total padding
+    if (showKeysWhenCollapsed === 'auto') return (currentBPWidth - 80) / CHAR_W
+    return showKeysWhenCollapsed
+  }, [showKeysWhenCollapsed, currentBPWidth])
+
   return (
-    <Container
-      fontFamily="monospace.fontFamily"
-      fontSize="body2.fontSize"
-      width="100%"
-      {...props}
-    >
-      <JsonDisplayInner {...{ name, value, topLevel }} />
-    </Container>
+    <M.Box className={cx(className, classes.root)} {...props}>
+      <JsonDisplayInner
+        {...{ name, value, topLevel, defaultExpanded, classes }}
+        showKeysWhenCollapsed={computedKeys}
+      />
+    </M.Box>
   )
 }

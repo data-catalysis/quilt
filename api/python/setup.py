@@ -1,9 +1,8 @@
 import os
 import sys
-
 from pathlib import Path
 
-from setuptools import setup, find_packages
+from setuptools import find_packages, setup
 from setuptools.command.install import install
 
 VERSION = Path(Path(__file__).parent, "quilt3", "VERSION").read_text().strip()
@@ -53,7 +52,7 @@ setup(
     ],
     author='quiltdata',
     author_email='contact@quiltdata.io',
-    license='LICENSE',
+    license='Apache-2.0',
     url='https://github.com/quiltdata/quilt',
     keywords='',
     install_requires=[
@@ -69,8 +68,9 @@ setup(
         'PyYAML>=5.1',
         'requests>=2.12.4',
         'tenacity>=5.1.1',
-        'tqdm>=4.26.0',
+        'tqdm>=4.32',
         'requests_futures==1.0.0',
+        'jsonschema==3.*',
     ],
     extras_require={
         'pyarrow': [
@@ -79,13 +79,14 @@ setup(
             'pyarrow>=0.14.1',              # as of 7/5/19: linux/circleci bugs on 0.14.0
         ],
         'tests': [
-            'codecov',
+            'urllib3<1.26,>=1.25.4'         # https://github.com/quiltdata/quilt/pull/1903
             'numpy>=1.14.0',                # required by pandas, but missing from its dependencies.
             'pandas>=0.19.2',
             'pyarrow>=0.14.1',              # as of 7/5/19: linux/circleci bugs on 0.14.0
             'pytest<5.1.0',                 # TODO: Fix pytest.ensuretemp in conftest.py
             'pytest-cov',
             'pytest-env',
+            'pytest-subtests',
             'responses',
             'tox',
             'detox',

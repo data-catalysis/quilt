@@ -1,45 +1,67 @@
-import inspect
-from collections import deque
 import gc
 import hashlib
+import inspect
 import io
 import json
-import pathlib
 import os
+import pathlib
 import shutil
+import textwrap
 import time
-from multiprocessing import Pool
 import uuid
 import warnings
+from collections import deque
+from multiprocessing import Pool
 
 import jsonlines
 from tqdm import tqdm
 
+from . import workflows
 from .backends import get_package_registry
 from .data_transfer import (
-    calculate_sha256, copy_file, copy_file_list, get_bytes, get_size_and_version,
-    list_object_versions, list_url, put_bytes
+    calculate_sha256,
+    copy_file,
+    copy_file_list,
+    get_bytes,
+    get_size_and_version,
+    list_object_versions,
+    list_url,
+    put_bytes,
 )
 from .exceptions import PackageException
 from .formats import FormatRegistry
 from .telemetry import ApiTelemetry
+from .util import CACHE_PATH, DISABLE_TQDM, PACKAGE_UPDATE_POLICY
+from .util import TEMPFILE_DIR_PATH as APP_DIR_TEMPFILE_DIR
 from .util import (
-    QuiltException, fix_url, get_from_config, get_install_location,
-    validate_package_name, quiltignore_filter, validate_key, extract_file_extension,
-    parse_sub_package_name, RemovedInQuilt4Warning, PACKAGE_UPDATE_POLICY)
-from .util import CACHE_PATH, TEMPFILE_DIR_PATH as APP_DIR_TEMPFILE_DIR, PhysicalKey, \
-    user_is_configured_to_custom_stack, catalog_package_url, DISABLE_TQDM
+    PhysicalKey,
+    QuiltException,
+    RemovedInQuilt4Warning,
+    catalog_package_url,
+    extract_file_extension,
+    fix_url,
+    get_from_config,
+    get_install_location,
+    parse_sub_package_name,
+    quiltignore_filter,
+    user_is_configured_to_custom_stack,
+    validate_key,
+    validate_package_name,
+)
 
 
-def hash_file(readable_file):
-    """ Returns SHA256 hash of readable file-like object """
-    buf = readable_file.read(4096)
-    hasher = hashlib.sha256()
-    while buf:
-        hasher.update(buf)
-        buf = readable_file.read(4096)
+def _fix_docstring(**kwargs):
+    def f(wrapped):
+        wrapped.__doc__ = textwrap.dedent(wrapped.__doc__) % kwargs
+        return wrapped
+    return f
 
-    return hasher.hexdigest()
+
+_WORKFLOW_PARAM_DOCSTRING = (
+    'workflow: workflow ID or `None` to skip workflow validation.\n'
+    '        If not specified, the default workflow will be used.\n'
+    '        For details see: https://docs.quiltdata.com/advanced-usage/workflows\n'
+)
 
 
 def _delete_local_physical_key(pk):
@@ -168,7 +190,6 @@ class PackageEntry:
         Returns self with the physical key set to path.
 
         Args:
-            logical_key(string): logical key to update
             path(string): new path to place at logical_key in the package
                 Currently only supports a path on local disk
             meta(dict): metadata dict to attach to entry. If meta is provided, set just
@@ -310,8 +331,19 @@ class PackageEntry:
         return [self.physical_key]
 
 
+class PackageRevInfo:
+    __slots__ = ('registry', 'name', 'top_hash')
+
+    def __init__(self, registry, name, top_hash):
+        self.registry = registry
+        self.name = name
+        self.top_hash = top_hash
+
+
 class Package:
     """ In-memory representation of a package """
+
+    _origin = None
 
     def __init__(self):
         self._children = {}
@@ -511,14 +543,18 @@ class Package:
         except TypeError:
             name, registry, hash_prefix = cls._parse_resolve_hash_args(*args, **kwargs)
             validate_package_name(name)
+            return get_package_registry(registry).resolve_top_hash(name, hash_prefix)
         else:
+            registry = get_package_registry(registry)
+            if registry.resolve_top_hash_requires_pkg_name:
+                raise TypeError(f'Package name is required for resolving top hash at {registry.root}.')
             warnings.warn(
                 "Calling resolve_hash() without the 'name' parameter is deprecated.",
                 category=RemovedInQuilt4Warning,
                 stacklevel=2,
             )
+            return registry.resolve_top_hash(name, hash_prefix)
 
-        return get_package_registry(registry).resolve_top_hash(name, hash_prefix)
     # This is needed for nice signature in docs.
     resolve_hash.__func__.__signature__ = inspect.signature(_parse_resolve_hash_args.__func__)
 
@@ -563,7 +599,7 @@ class Package:
     @classmethod
     def _from_path(cls, path):
         """ Takes a path and returns a package loaded from that path"""
-        with open(path) as open_file:
+        with open(path, encoding='utf-8') as open_file:
             pkg = cls._load(open_file)
         return pkg
 
@@ -712,7 +748,15 @@ class Package:
             readable_file.seek(0)
 
             reader = jsonlines.Reader(
-                tqdm(readable_file, desc="Loading manifest", total=line_count, unit="entries", disable=DISABLE_TQDM),
+                tqdm(
+                    readable_file,
+                    desc="Loading manifest",
+                    total=line_count,
+                    unit="",
+                    unit_scale=True,
+                    disable=DISABLE_TQDM,
+                    bar_format='{l_bar}{bar}| {n}/{total} [{elapsed}<{remaining}, {rate_fmt}]',
+                ),
                 loads=json.loads,
             )
             meta = reader.read()
@@ -927,20 +971,38 @@ class Package:
         )
         return pkg_manifest_file.path
 
+    @property
+    def _workflow(self):
+        return self._meta.get('workflow')
+
+    @_workflow.setter
+    def _workflow(self, value):
+        if value:
+            self._meta['workflow'] = value
+        else:
+            self._meta.pop('workflow', None)
+
+    def _validate_with_workflow(self, *, registry, workflow, message):
+        self._workflow = workflows.validate(registry=registry, workflow=workflow, meta=self.meta, message=message)
+
     @ApiTelemetry("package.build")
-    def build(self, name, registry=None, message=None):
+    @_fix_docstring(workflow=_WORKFLOW_PARAM_DOCSTRING)
+    def build(self, name, registry=None, message=None, *, workflow=...):
         """
         Serializes this package to a registry.
 
         Args:
             name: optional name for package
             registry: registry to build to
-                    defaults to local registry
+                defaults to local registry
             message: the commit message of the package
+            %(workflow)s
 
         Returns:
             The top hash as a string.
         """
+        registry = get_package_registry(registry)
+        self._validate_with_workflow(registry=registry, workflow=workflow, message=message)
         return self._build(name=name, registry=registry, message=message)
 
     def _build(self, name, registry, message):
@@ -954,7 +1016,8 @@ class Package:
         self._dump(manifest)
 
         top_hash = self.top_hash
-        registry.push_manifest(name, top_hash, manifest.getvalue())
+        self._timestamp = registry.push_manifest(name, top_hash, manifest.getvalue())
+        self._origin = PackageRevInfo(str(registry.base), name, top_hash)
 
         return top_hash
 
@@ -1158,23 +1221,31 @@ class Package:
         """
         top_hash = hashlib.sha256()
         assert 'top_hash' not in self._meta
-        top_meta = json.dumps(self._meta, sort_keys=True, separators=(',', ':'))
-        top_hash.update(top_meta.encode('utf-8'))
+
+        json_encode = json.JSONEncoder(sort_keys=True, separators=(',', ':')).encode
+        for part in self._get_top_hash_parts():
+            top_hash.update(json_encode(part).encode())
+
+        return top_hash.hexdigest()
+
+    def _get_top_hash_parts(self):
+        yield self._meta
+        # TODO: dir-level metadata should affect top hash as well.
         for logical_key, entry in self.walk():
             if entry.hash is None or entry.size is None:
                 raise QuiltException(
                     "PackageEntry missing hash and/or size: %s" % entry.physical_key
                 )
-            entry_dict = entry.as_dict()
-            entry_dict['logical_key'] = logical_key
-            entry_dict.pop('physical_keys', None)
-            entry_dict_str = json.dumps(entry_dict, sort_keys=True, separators=(',', ':'))
-            top_hash.update(entry_dict_str.encode('utf-8'))
-
-        return top_hash.hexdigest()
+            yield {
+                'hash': entry.hash,
+                'logical_key': logical_key,
+                'meta': entry._meta,
+                'size': entry.size,
+            }
 
     @ApiTelemetry("package.push")
-    def push(self, name, registry=None, dest=None, message=None, selector_fn=None):
+    @_fix_docstring(workflow=_WORKFLOW_PARAM_DOCSTRING)
+    def push(self, name, registry=None, dest=None, message=None, selector_fn=None, *, workflow=...):
         """
         Copies objects to path, then creates a new package that points to those objects.
         Copies each object in this package to path according to logical key structure,
@@ -1207,10 +1278,14 @@ class Package:
                 PackageEntry should be skipped during push. If for example you have a package where the files
                 are spread over multiple buckets and you add a single local file, you can use selector_fn to
                 only push the local file to s3 (instead of pushing all data to the destination bucket).
+            %(workflow)s
 
         Returns:
             A new package that points to the copied objects.
         """
+        return self._push(name, registry, dest, message, selector_fn, workflow=workflow, print_info=True)
+
+    def _push(self, name, registry=None, dest=None, message=None, selector_fn=None, *, workflow, print_info):
         if selector_fn is None:
             def selector_fn(*args):
                 return True
@@ -1251,6 +1326,9 @@ class Package:
                     f"Invalid package destination path {dest!r}. 'dest', if set, must be a path "
                     f"in the {registry!r} package registry specified by 'registry'."
                 )
+
+        registry = get_package_registry(registry)
+        self._validate_with_workflow(registry=registry, workflow=workflow, message=message)
 
         self._fix_sha256()
 
@@ -1305,20 +1383,21 @@ class Package:
 
         top_hash = pkg._build(name, registry=registry, message=message)
 
-        shorthash = get_package_registry(registry).shorten_top_hash(name, top_hash)
-        print(f"Package {name}@{shorthash} pushed to s3://{dest_parsed.bucket}")
+        if print_info:
+            shorthash = registry.shorten_top_hash(name, top_hash)
+            print(f"Package {name}@{shorthash} pushed to s3://{dest_parsed.bucket}")
 
-        if user_is_configured_to_custom_stack():
-            navigator_url = get_from_config("navigator_url")
+            if user_is_configured_to_custom_stack():
+                navigator_url = get_from_config("navigator_url")
 
-            print(f"Successfully pushed the new package to "
-                  f"{catalog_package_url(navigator_url, dest_parsed.bucket, name)}")
-        else:
-            dest_s3_url = str(dest_parsed)
-            if not dest_s3_url.endswith("/"):
-                dest_s3_url += "/"
-            print(f"Run `quilt3 catalog {dest_s3_url}` to browse.")
-            print("Successfully pushed the new package")
+                print(f"Successfully pushed the new package to "
+                      f"{catalog_package_url(navigator_url, dest_parsed.bucket, name, tree=False)}")
+            else:
+                dest_s3_url = str(dest_parsed)
+                if not dest_s3_url.endswith("/"):
+                    dest_s3_url += "/"
+                print(f"Run `quilt3 catalog {dest_s3_url}` to browse.")
+                print("Successfully pushed the new package")
 
         return pkg
 

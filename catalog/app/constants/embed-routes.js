@@ -6,15 +6,16 @@ export const bucketRoot = {
   url: (bucket) => `/b/${bucket}`,
 }
 export const bucketFile = {
-  path: '/b/:bucket/tree/:path+',
+  path: '/b/:bucket/tree/:path(.*[^/])',
   url: (bucket, path, version) =>
     `/b/${bucket}/tree/${encode(path)}${mkSearch({ version })}`,
 }
 export const bucketDir = {
   path: '/b/:bucket/tree/:path(.+/)?',
-  url: (bucket, path = '') => `/b/${bucket}/tree/${encode(path)}`,
+  url: (bucket, path = '', prefix) =>
+    `/b/${bucket}/tree/${encode(path)}${mkSearch({ prefix: prefix || undefined })}`,
 }
 export const bucketSearch = {
   path: '/b/:bucket/search',
-  url: (bucket, q, p) => `/b/${bucket}/search${mkSearch({ q, p })}`,
+  url: (bucket, { q, p, retry }) => `/b/${bucket}/search${mkSearch({ q, p, retry })}`,
 }

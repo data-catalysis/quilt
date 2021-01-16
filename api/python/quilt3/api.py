@@ -1,12 +1,22 @@
 from .backends import get_package_registry
 from .data_transfer import copy_file
 from .search_util import search_api
-from .util import (QuiltConfig, QuiltException, CONFIG_PATH,
-                   CONFIG_TEMPLATE, configure_from_default, config_exists,
-                   configure_from_url, fix_url,
-                   load_config, PhysicalKey, read_yaml, validate_package_name,
-                   write_yaml)
 from .telemetry import ApiTelemetry
+from .util import (
+    CONFIG_PATH,
+    CONFIG_TEMPLATE,
+    PhysicalKey,
+    QuiltConfig,
+    QuiltException,
+    config_exists,
+    configure_from_default,
+    configure_from_url,
+    fix_url,
+    load_config,
+    read_yaml,
+    validate_package_name,
+    write_yaml,
+)
 
 
 def copy(src, dest):
@@ -34,7 +44,11 @@ def delete_package(name, registry=None, top_hash=None):
         top_hash (str): Optional. A package hash to delete, instead of the whole package.
     """
     validate_package_name(name)
-    get_package_registry(registry).delete_package(name, top_hash)
+    registry = get_package_registry(registry)
+    if top_hash is None:
+        registry.delete_package(name)
+    else:
+        registry.delete_package_version(name, registry.resolve_top_hash(name, top_hash))
 
 
 @ApiTelemetry("api.list_packages")

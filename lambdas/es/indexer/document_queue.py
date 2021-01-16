@@ -1,19 +1,18 @@
 """ core logic for fetching documents from S3 and queueing them locally before
 sending to elastic search in memory-limited batches"""
+import os
 from datetime import datetime
 from enum import Enum
 from math import floor
-from typing import List
-import os
+from typing import Dict, List
 
-from aws_requests_auth.aws_auth import AWSRequestsAuth
 import boto3
+from aws_requests_auth.aws_auth import AWSRequestsAuth
 from elasticsearch import Elasticsearch, RequestsHttpConnection
 from elasticsearch.helpers import bulk
 
-from t4_lambda_shared.utils import separated_env_to_iter
 from t4_lambda_shared.preview import ELASTIC_LIMIT_BYTES
-
+from t4_lambda_shared.utils import separated_env_to_iter
 
 CONTENT_INDEX_EXTS = separated_env_to_iter("CONTENT_INDEX_EXTS") or {
     ".csv",
@@ -71,7 +70,9 @@ class DocumentQueue:
             ext: str = '',
             handle: str = '',
             metadata: str = '',
+            pointer_file: str = '',
             package_hash: str = '',
+            package_stats: Dict[str, int] = None,
             tags: List[str] = (),
             text: str = '',
             version_id=None,
@@ -114,15 +115,25 @@ class DocumentQueue:
             "size": size,
         }
         if doc_type == DocTypes.PACKAGE:
-            if not handle or not package_hash:
+            if not handle or not package_hash or not pointer_file:
                 raise ValueError("missing required argument for package document")
+            if not (
+                package_stats is None
+                or isinstance(package_stats, dict) and {'total_files', 'total_bytes'}.issubset(package_stats)
+            ):
+                raise ValueError("Malformed package_stats")
             body.update({
                 "_id": f"{handle}:{package_hash}",
                 "handle": handle,
                 "hash": package_hash,
                 "metadata": metadata,
+                "pointer_file": pointer_file,
                 "tags": ",".join(tags)
             })
+            if package_stats:
+                body.update({
+                    "package_stats": package_stats,
+                })
         elif doc_type == DocTypes.OBJECT:
             body.update({
                 # Elastic native keys

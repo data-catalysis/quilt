@@ -3,26 +3,24 @@ import { basename } from 'path'
 import dedent from 'dedent'
 import * as R from 'ramda'
 import * as React from 'react'
+import { useHistory } from 'react-router-dom'
 import * as M from '@material-ui/core'
 
 import { Crumb, copyWithoutSpaces, render as renderCrumbs } from 'components/BreadCrumbs'
-import Message from 'components/Message'
-import { docs } from 'constants/urls'
 import AsyncResult from 'utils/AsyncResult'
 import * as AWS from 'utils/AWS'
+import * as Config from 'utils/Config'
 import { useData } from 'utils/Data'
 import * as NamedRoutes from 'utils/NamedRoutes'
-import Link from 'utils/StyledLink'
+import parseSearch from 'utils/parseSearch'
 import { getBreadCrumbs, ensureNoSlash, withoutPrefix, up, decode } from 'utils/s3paths'
-import usePrevious from 'utils/usePrevious'
 
 import Code from './Code'
-import Listing, { ListingItem } from './Listing'
+import * as FileView from './FileView'
+import { ListingItem, ListingWithPrefixFiltering } from './Listing'
 import Summary from './Summary'
 import { displayError } from './errors'
 import * as requests from './requests'
-
-const HELP_LINK = `${docs}/walkthrough/working-with-a-bucket`
 
 const getCrumbs = R.compose(
   R.intersperse(Crumb.Sep(<>&nbsp;/ </>)),
@@ -43,16 +41,17 @@ const formatListing = ({ urls }, r) => {
       to: urls.bucketDir(r.bucket, name),
     }),
   )
-  const files = r.files.map(({ key, size, modified }) =>
+  const files = r.files.map(({ key, size, modified, archived }) =>
     ListingItem.File({
       name: basename(key),
       to: urls.bucketFile(r.bucket, key),
       size,
       modified,
+      archived,
     }),
   )
   const items = [
-    ...(r.path !== ''
+    ...(r.path !== '' && !r.prefix
       ? [
           ListingItem.Dir({
             name: '..',
@@ -79,10 +78,14 @@ export default function Dir({
   match: {
     params: { bucket, path: encodedPath = '' },
   },
+  location: l,
 }) {
   const classes = useStyles()
   const { urls } = NamedRoutes.use()
+  const { noDownload } = Config.use()
+  const history = useHistory()
   const s3 = AWS.S3.use()
+  const { prefix } = parseSearch(l.search)
   const path = decode(encodedPath)
   const dest = path ? basename(path) : bucket
 
@@ -114,28 +117,19 @@ export default function Dir({
     [bucket, path, dest],
   )
 
-  const [prev, setPrev] = React.useState(null)
-  const prevPath = usePrevious(path, () => {
-    if (prevPath !== path) setPrev(null)
-  })
   const data = useData(requests.bucketListing, {
     s3,
     bucket,
     path,
-    prev: prevPath === path ? prev : null,
+    prefix,
   })
 
-  const loadMore = React.useCallback(() => {
-    AsyncResult.case(
-      {
-        Ok: (res) => {
-          if (res.continuationToken) setPrev(res)
-        },
-        _: () => {},
-      },
-      data.result,
-    )
-  }, [data.result])
+  const setPrefix = React.useCallback(
+    (newPrefix) => {
+      history.push(urls.bucketDir(bucket, path, newPrefix))
+    },
+    [history, urls, bucket, path],
+  )
 
   return (
     <M.Box pt={2} pb={4}>
@@ -144,6 +138,12 @@ export default function Dir({
           {renderCrumbs(getCrumbs({ bucket, path, urls }))}
         </div>
         <M.Box flexGrow={1} />
+        {!noDownload && (
+          <FileView.ZipDownloadForm
+            suffix={`dir/${bucket}/${path}`}
+            label="Download directory"
+          />
+        )}
       </M.Box>
 
       <Code gutterBottom>{code}</Code>
@@ -168,22 +168,19 @@ export default function Dir({
 
           const items = formatListing({ urls }, res)
 
-          if (!items.length)
-            return (
-              <Message headline="No files">
-                <Link href={HELP_LINK}>Learn how to upload files</Link>.
-              </Message>
-            )
-
           const locked = !AsyncResult.Ok.is(x)
 
+          // TODO: should prefix filtering affect summary?
           return (
             <>
-              <Listing
+              <ListingWithPrefixFiltering
                 items={items}
-                truncated={res.truncated}
                 locked={locked}
-                loadMore={!!res.continuationToken && loadMore}
+                truncated={res.truncated}
+                prefix={res.prefix}
+                setPrefix={setPrefix}
+                bucket={res.bucket}
+                path={res.path}
               />
               <Summary files={res.files} />
             </>

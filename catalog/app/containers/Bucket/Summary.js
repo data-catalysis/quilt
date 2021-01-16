@@ -20,21 +20,17 @@ import * as requests from './requests'
 const README_RE = /^readme\.md$/i
 const SUMMARIZE_RE = /^quilt_summarize\.json$/i
 
-const withSignedUrl = (handle, callback) => (
-  <AWS.Signer.Inject>
-    {(signer) => callback(signer.getSignedS3URL(handle))}
-  </AWS.Signer.Inject>
-)
-
 const findFile = (re) => R.find((f) => re.test(getBasename(f.logicalKey || f.key)))
 
 const extractSummary = R.applySpec({
   readme: findFile(README_RE),
   summarize: findFile(SUMMARIZE_RE),
-  images: R.filter((f) =>
-    SUPPORTED_EXTENSIONS.some((ext) =>
-      (f.logicalKey || f.key).toLowerCase().endsWith(ext),
-    ),
+  images: R.filter(
+    (f) =>
+      !f.archived &&
+      SUPPORTED_EXTENSIONS.some((ext) =>
+        (f.logicalKey || f.key).toLowerCase().endsWith(ext),
+      ),
   ),
 })
 
@@ -57,16 +53,18 @@ function HandleResolver({ resolve, handle, children }) {
   return children(AsyncResult.Ok(handle))
 }
 
+const renderContents = (contents) => <M.Box mx="auto">{contents}</M.Box>
+
 function SummaryItemFile({ handle, name, mkUrl, resolveLogicalKey }) {
-  const renderErr = (_, { fetch }) => (
-    <>
-      <M.Typography variant="body1" gutterBottom>
-        Error loading preview
-      </M.Typography>
-      <M.Button variant="outlined" onClick={fetch}>
-        Retry
-      </M.Button>
-    </>
+  const withData = (callback) => (
+    <HandleResolver resolve={resolveLogicalKey} handle={handle}>
+      {AsyncResult.case({
+        Err: (e, { fetch }) =>
+          Preview.PreviewError.Unexpected({ handle, retry: fetch, originalError: e }),
+        Ok: (resolved) => Preview.load(resolved, callback),
+        _: callback,
+      })}
+    </HandleResolver>
   )
 
   return (
@@ -76,71 +74,7 @@ function SummaryItemFile({ handle, name, mkUrl, resolveLogicalKey }) {
           {name || basename(handle.logicalKey || handle.key)}
         </StyledLink>
       </Header>
-      <M.CardContent>
-        <HandleResolver resolve={resolveLogicalKey} handle={handle}>
-          {AsyncResult.case({
-            Err: renderErr,
-            _: () => <M.CircularProgress />,
-            Ok: (resolved) =>
-              Preview.load(
-                resolved,
-                AsyncResult.case({
-                  Ok: AsyncResult.case({
-                    Init: (_, { fetch }) => (
-                      <>
-                        <M.Typography variant="body1" gutterBottom>
-                          Large files are not previewed automatically
-                        </M.Typography>
-                        <M.Button variant="outlined" onClick={fetch}>
-                          Load preview
-                        </M.Button>
-                      </>
-                    ),
-                    Pending: () => <M.CircularProgress />,
-                    Err: renderErr,
-                    Ok: (data) => <M.Box mx="auto">{Preview.render(data)}</M.Box>,
-                  }),
-                  Err: Preview.PreviewError.case({
-                    TooLarge: () => (
-                      <>
-                        <M.Typography variant="body1" gutterBottom>
-                          Object is too large to preview in browser
-                        </M.Typography>
-                        {withSignedUrl(resolved, (url) => (
-                          <M.Button variant="outlined" href={url}>
-                            View in Browser
-                          </M.Button>
-                        ))}
-                      </>
-                    ),
-                    Unsupported: () => (
-                      <>
-                        <M.Typography variant="body1" gutterBottom>
-                          Preview not available
-                        </M.Typography>
-                        {withSignedUrl(resolved, (url) => (
-                          <M.Button variant="outlined" href={url}>
-                            View in Browser
-                          </M.Button>
-                        ))}
-                      </>
-                    ),
-                    DoesNotExist: () => (
-                      <M.Typography variant="body1">Object does not exist</M.Typography>
-                    ),
-                    MalformedJson: ({ originalError: { message } }) => (
-                      <M.Typography variant="body1" gutterBottom>
-                        Malformed JSON: {message}
-                      </M.Typography>
-                    ),
-                    Unexpected: renderErr,
-                  }),
-                  _: () => <M.CircularProgress />,
-                }),
-              ),
-          })}
-        </HandleResolver>
-      </M.CardContent>
+      <M.CardContent>{withData(Preview.display({ renderContents }))}</M.CardContent>
     </Container>
   )
 }
@@ -174,9 +108,12 @@ function Thumbnails({ images, mkUrl, resolveLogicalKey }) {
   const classes = useThumbnailsStyles()
 
   const scrollRef = React.useRef(null)
-  const scroll = React.useCallback((prev) => {
-    if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
-  })
+  const scroll = React.useCallback(
+    (prev) => {
+      if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
+    },
+    [scrollRef],
+  )
 
   const pagination = Pagination.use(images, { perPage: 25, onChange: scroll })
 
@@ -243,7 +180,7 @@ export default function BucketSummary({
       mkUrlProp
         ? mkUrlProp(handle)
         : urls.bucketFile(handle.bucket, handle.key, handle.version),
-    [mkUrlProp, urls.bucketFile],
+    [mkUrlProp, urls],
   )
   const { readme, images, summarize } = extractSummary(files)
 
@@ -268,7 +205,9 @@ export default function BucketSummary({
             >
               {AsyncResult.case({
                 Err: (e) => {
+                  // eslint-disable-next-line no-console
                   console.warn('Error loading summary')
+                  // eslint-disable-next-line no-console
                   console.error(e)
                   return null
                 },

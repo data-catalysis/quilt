@@ -24,6 +24,8 @@ import WithGlobalStyles from '../global-styles'
 
 import { translationMessages } from '../i18n'
 
+const SRC = '/__embed'
+
 function useField(init) {
   const [value, set] = React.useState(init)
   const onChange = React.useCallback(
@@ -45,6 +47,7 @@ function Embedder() {
     credentials: useField('{}'),
     bucket: useField(''),
     path: useField(''),
+    scope: useField(''),
     rest: useField('{}'),
   }
 
@@ -53,8 +56,9 @@ function Embedder() {
       return {
         bucket: fields.bucket.value,
         path: fields.path.value,
+        scope: fields.scope.value,
         credentials: JSON.parse(fields.credentials.value),
-        ...JSON.parse(fields.rest.value),
+        ...JSON.parse(fields.rest.value || '{}'),
       }
     } catch (e) {
       return e
@@ -63,18 +67,20 @@ function Embedder() {
     fields.credentials.value,
     fields.bucket.value,
     fields.path.value,
+    fields.scope.value,
     fields.rest.value,
   ])
 
   const getOktaCredentials = React.useCallback(async () => {
     const token = await authenticate()
     fields.credentials.set(JSON.stringify({ provider: 'okta', token }))
-  }, [authenticate, fields.credentials.set])
+  }, [authenticate, fields.credentials.set]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const postMessage = React.useCallback(
     (msg) => {
       if (!iframeRef.current) return
       const w = iframeRef.current.contentWindow
+      // eslint-disable-next-line no-console
       console.log('Sending message to the iframe', msg)
       // TODO: use origin?
       w.postMessage(msg)
@@ -86,6 +92,12 @@ function Embedder() {
     if (initParams instanceof Error) return
     postMessage({ type: 'init', ...initParams })
   }, [postMessage, initParams])
+
+  const reloadIframe = React.useCallback(() => {
+    if (iframeRef.current) {
+      iframeRef.current.src = SRC
+    }
+  }, [iframeRef])
 
   return (
     <M.Box display="flex" justifyContent="space-between" p={2} maxHeight="100vh">
@@ -117,6 +129,9 @@ function Embedder() {
         <M.TextField label="Path" fullWidth {...fields.path.input} />
 
         <M.Box mt={2} />
+        <M.TextField label="Scope" fullWidth {...fields.scope.input} />
+
+        <M.Box mt={2} />
         <M.TextField
           multiline
           label="Extra params (JSON, merged with the rest)"
@@ -128,6 +143,11 @@ function Embedder() {
         <M.Box mt={2} />
         <M.Button variant="outlined" onClick={postInit}>
           init
+        </M.Button>
+
+        <M.Box mt={1} />
+        <M.Button variant="outlined" onClick={reloadIframe}>
+          reload iframe
         </M.Button>
 
         <M.Box
@@ -144,7 +164,7 @@ function Embedder() {
 
       <iframe
         title="embed"
-        src="/__embed"
+        src={SRC}
         width="900"
         height="600"
         ref={iframeRef}

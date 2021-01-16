@@ -1,18 +1,24 @@
-import re
-from collections import OrderedDict
 import datetime
 import json
 import os
 import pathlib
-from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse, urlunparse
-from urllib.request import pathname2url, url2pathname
+import re
 import warnings
+from collections import OrderedDict
+from urllib.parse import (
+    parse_qs,
+    quote,
+    unquote,
+    urlencode,
+    urlparse,
+    urlunparse,
+)
+from urllib.request import pathname2url, url2pathname
 
+import requests
 # Third-Party
 import yaml
 from appdirs import user_cache_dir, user_data_dir
-import requests
-
 
 APP_NAME = "Quilt"
 APP_AUTHOR = "QuiltData"
@@ -66,6 +72,8 @@ apiGatewayEndpoint:
 # Binary API Gateway endpoint (e.g., for preview)
 binaryApiGatewayEndpoint:
 
+default_registry_version: 1
+
 """.format(BASE_PATH.as_uri() + '/packages')
 
 
@@ -82,6 +90,10 @@ class QuiltException(Exception):
 
 
 class RemovedInQuilt4Warning(FutureWarning):
+    pass
+
+
+class URLParseError(ValueError):
     pass
 
 
@@ -114,7 +126,7 @@ class PhysicalKey:
 
         if parsed.scheme == 's3':
             if not parsed.netloc:
-                raise ValueError("Missing bucket")
+                raise URLParseError("Missing bucket")
             bucket = parsed.netloc
             assert not parsed.path or parsed.path.startswith('/')
             path = unquote(parsed.path)[1:]
@@ -123,24 +135,24 @@ class PhysicalKey:
             query = parse_qs(parsed.query)
             version_id = query.pop('versionId', [None])[0]
             if query:
-                raise ValueError(f"Unexpected S3 query string: {parsed.query!r}")
+                raise URLParseError(f"Unexpected S3 query string: {parsed.query!r}")
             return cls(bucket, path, version_id)
         elif parsed.scheme == 'file':
             if parsed.netloc not in ('', 'localhost'):
-                raise ValueError("Unexpected hostname")
+                raise URLParseError("Unexpected hostname")
             if not parsed.path:
-                raise ValueError("Missing path")
+                raise URLParseError("Missing path")
             if not parsed.path.startswith('/'):
-                raise ValueError("Relative paths are not allowed")
+                raise URLParseError("Relative paths are not allowed")
             if parsed.query:
-                raise ValueError("Unexpected query")
+                raise URLParseError("Unexpected query")
             path = url2pathname(parsed.path)
             if parsed.path.endswith('/') and not path.endswith(os.path.sep):
                 # On Windows, url2pathname loses the trailing `/`.
                 path += os.path.sep
             return cls.from_path(path)
         else:
-            raise ValueError(f"Unexpected scheme: {parsed.scheme!r}")
+            raise URLParseError(f"Unexpected scheme: {parsed.scheme!r}")
 
     @classmethod
     def from_path(cls, path):
@@ -518,10 +530,11 @@ def catalog_s3_url(catalog_url, s3_url):
     return url
 
 
-def catalog_package_url(catalog_url, bucket, package_name, package_timestamp="latest"):
+def catalog_package_url(catalog_url, bucket, package_name, package_timestamp="latest", tree=True):
     """
     Generate a URL to the Quilt catalog page of a package. By default will go to the latest version of the package,
     but the user can pass in the appropriate timestamp to go to a different version.
+    Disabling tree by passing `tree=False` will generate a package URL without tree path.
 
     Note: There is currently no good way to generate the URL given a specific tophash
     """
@@ -529,4 +542,7 @@ def catalog_package_url(catalog_url, bucket, package_name, package_timestamp="la
     assert package_name is not None, "The package_name parameter must not be None"
     validate_package_name(package_name)
 
-    return f"{catalog_url}/b/{bucket}/packages/{package_name}/tree/{package_timestamp}"
+    package_url = f"{catalog_url}/b/{bucket}/packages/{package_name}"
+    if tree:
+        package_url = package_url + f"/tree/{package_timestamp}"
+    return package_url

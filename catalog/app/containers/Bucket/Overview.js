@@ -22,7 +22,7 @@ import * as NamedRoutes from 'utils/NamedRoutes'
 import * as SVG from 'utils/SVG'
 import Link from 'utils/StyledLink'
 import { getBreadCrumbs } from 'utils/s3paths'
-import { readableBytes, readableQuantity } from 'utils/string'
+import { readableBytes, readableQuantity, formatQuantity } from 'utils/string'
 
 import * as requests from './requests'
 
@@ -652,9 +652,12 @@ const useStatDisplayStyles = M.makeStyles((t) => ({
     alignItems: 'baseline',
     display: 'flex',
     '& + &': {
-      marginLeft: t.spacing(1),
+      marginLeft: t.spacing(1.5),
       [t.breakpoints.up('sm')]: {
-        marginLeft: t.spacing(3),
+        marginLeft: t.spacing(4),
+      },
+      [t.breakpoints.up('md')]: {
+        marginLeft: t.spacing(6),
       },
     },
   },
@@ -704,12 +707,13 @@ function StatDisplay({ value, label, format, fallback }) {
       _: R.identity,
     }),
     AsyncResult.case({
-      Ok: (v) => (
-        <span className={classes.root}>
-          <span className={classes.value}>{v}</span>
-          {!!label && <span className={classes.label}>{label}</span>}
-        </span>
-      ),
+      Ok: (v) =>
+        v != null && (
+          <span className={classes.root}>
+            <span className={classes.value}>{v}</span>
+            {!!label && <span className={classes.label}>{label}</span>}
+          </span>
+        ),
       _: () => (
         <div className={cx(classes.root, classes.skeletonContainer)}>
           <Skeleton className={classes.skeleton} bgcolor="grey.400" />
@@ -749,87 +753,86 @@ const useHeadStyles = M.makeStyles((t) => ({
   },
 }))
 
-function Head({ es, s3, overviewUrl, bucket, description }) {
+function Head({ req, s3, overviewUrl, bucket, description }) {
   const classes = useHeadStyles()
   const isRODA = !!overviewUrl && overviewUrl.includes(`/${RODA_BUCKET}/`)
   const colorPool = useConst(() => mkKeyedPool(COLOR_MAP))
+  const statsData = useData(requests.bucketStats, { req, s3, bucket, overviewUrl })
+  const pkgStatsData = useData(requests.bucketPkgStats, { req, bucket })
   return (
-    <Data fetch={requests.bucketStats} params={{ es, s3, bucket, overviewUrl }}>
-      {(res) => (
-        <M.Paper className={classes.root}>
-          <M.Box className={classes.top}>
-            <M.Typography variant="h5">{bucket}</M.Typography>
-            {!!description && (
-              <M.Box mt={1}>
-                <M.Typography variant="body1">{description}</M.Typography>
-              </M.Box>
-            )}
-            {isRODA && (
-              <M.Box
-                mt={1}
-                position={{ md: 'absolute' }}
-                right={{ md: 32 }}
-                bottom={{ md: 31 }}
-                color="grey.300"
-                textAlign={{ md: 'right' }}
-              >
-                <M.Typography variant="body2">
-                  From the{' '}
-                  <M.Link href={RODA_LINK} color="inherit" underline="always">
-                    Registry of Open Data on AWS
-                  </M.Link>
-                </M.Typography>
-              </M.Box>
-            )}
-            <M.Box mt={{ xs: 2, sm: 3 }} display="flex" alignItems="baseline">
-              <StatDisplay
-                value={AsyncResult.prop('totalObjects', res)}
-                format={readableQuantity}
-                label="Objects"
-                fallback={() => '?'}
-              />
-              <StatDisplay
-                value={AsyncResult.prop('totalBytes', res)}
-                format={readableBytes}
-                fallback={() => '? B'}
-              />
-            </M.Box>
+    <M.Paper className={classes.root}>
+      <M.Box className={classes.top}>
+        <M.Typography variant="h5">{bucket}</M.Typography>
+        {!!description && (
+          <M.Box mt={1}>
+            <M.Typography variant="body1">{description}</M.Typography>
           </M.Box>
+        )}
+        {isRODA && (
           <M.Box
-            p={{ xs: 2, sm: 4 }}
-            display="flex"
-            flexDirection={{ xs: 'column', md: 'row' }}
-            alignItems={{ md: 'flex-start' }}
-            position="relative"
+            mt={1}
+            position={{ md: 'absolute' }}
+            right={{ md: 32 }}
+            bottom={{ md: 31 }}
+            color="grey.300"
+            textAlign={{ md: 'right' }}
           >
-            <ObjectsByExt
-              data={AsyncResult.prop('exts', res)}
-              width="100%"
-              flexShrink={1}
-              colorPool={colorPool}
-            />
-            <M.Box
-              display="flex"
-              flexDirection="column"
-              justifyContent="center"
-              flexShrink={0}
-              height={{ xs: 32, md: '100%' }}
-              width={{ xs: '100%', md: 32 }}
-            >
-              <M.Hidden mdUp>
-                <M.Divider />
-              </M.Hidden>
-            </M.Box>
-            <Downloads
-              bucket={bucket}
-              colorPool={colorPool}
-              width="100%"
-              flexShrink={1}
-            />
+            <M.Typography variant="body2">
+              From the{' '}
+              <M.Link href={RODA_LINK} color="inherit" underline="always">
+                Registry of Open Data on AWS
+              </M.Link>
+            </M.Typography>
           </M.Box>
-        </M.Paper>
-      )}
-    </Data>
+        )}
+        <M.Box mt={{ xs: 2, sm: 3 }} display="flex" alignItems="baseline">
+          <StatDisplay
+            value={AsyncResult.prop('totalBytes', statsData.result)}
+            format={readableBytes}
+            fallback={() => '? B'}
+          />
+          <StatDisplay
+            value={AsyncResult.prop('totalObjects', statsData.result)}
+            format={readableQuantity}
+            label="Objects"
+            fallback={() => '?'}
+          />
+          <StatDisplay
+            value={AsyncResult.prop('totalPackages', pkgStatsData.result)}
+            format={formatQuantity}
+            label="Packages"
+            fallback={() => null}
+          />
+        </M.Box>
+      </M.Box>
+      <M.Box
+        p={{ xs: 2, sm: 4 }}
+        display="flex"
+        flexDirection={{ xs: 'column', md: 'row' }}
+        alignItems={{ md: 'flex-start' }}
+        position="relative"
+      >
+        <ObjectsByExt
+          data={AsyncResult.prop('exts', statsData.result)}
+          width="100%"
+          flexShrink={1}
+          colorPool={colorPool}
+        />
+        <M.Box
+          display="flex"
+          flexDirection="column"
+          justifyContent="center"
+          flexShrink={0}
+          height={{ xs: 32, md: '100%' }}
+          width={{ xs: '100%', md: 32 }}
+        >
+          <M.Hidden mdUp>
+            <M.Divider />
+          </M.Hidden>
+        </M.Box>
+        <Downloads bucket={bucket} colorPool={colorPool} width="100%" flexShrink={1} />
+      </M.Box>
+    </M.Paper>
   )
 }
 
@@ -933,7 +936,7 @@ const usePreviewBoxStyles = M.makeStyles((t) => ({
   },
 }))
 
-function PreviewBox({ data, expanded: defaultExpanded = false }) {
+function PreviewBox({ contents, expanded: defaultExpanded = false }) {
   const classes = usePreviewBoxStyles()
   const [expanded, setExpanded] = React.useState(defaultExpanded)
   const expand = React.useCallback(() => {
@@ -941,7 +944,7 @@ function PreviewBox({ data, expanded: defaultExpanded = false }) {
   }, [setExpanded])
   return (
     <div className={cx(classes.root, { [classes.expanded]: expanded })}>
-      {Preview.render(data)}
+      {contents}
       {!expanded && (
         <div className={classes.fade}>
           <M.Button variant="outlined" onClick={expand}>
@@ -953,7 +956,7 @@ function PreviewBox({ data, expanded: defaultExpanded = false }) {
   )
 }
 
-function FilePreview({ handle, headingOverride, fallback, expanded }) {
+function FilePreview({ handle, headingOverride, expanded }) {
   const { urls } = NamedRoutes.use()
 
   const crumbs = React.useMemo(() => {
@@ -969,75 +972,40 @@ function FilePreview({ handle, headingOverride, fallback, expanded }) {
     return { dirs, file }
   }, [handle, urls])
 
-  const renderCrumbs = () => (
-    <span onCopy={copyWithoutSpaces}>
-      {crumbs.dirs.map((c) => (
-        <React.Fragment key={`crumb:${c.to}`}>
-          <CrumbLink {...c} />
-          &nbsp;/{' '}
-        </React.Fragment>
-      ))}
-      <CrumbLink {...crumbs.file} />
-    </span>
-  )
+  const heading =
+    headingOverride != null ? (
+      headingOverride
+    ) : (
+      <span onCopy={copyWithoutSpaces}>
+        {crumbs.dirs.map((c) => (
+          <React.Fragment key={`crumb:${c.to}`}>
+            <CrumbLink {...c} />
+            &nbsp;/{' '}
+          </React.Fragment>
+        ))}
+        <CrumbLink {...crumbs.file} />
+      </span>
+    )
 
-  const heading = headingOverride != null ? headingOverride : renderCrumbs()
-
-  return Preview.load(
-    handle,
-    AsyncResult.case({
-      Ok: AsyncResult.case({
-        Init: (_, { fetch }) => (
-          <Section heading={heading}>
-            <M.Typography variant="body1" gutterBottom>
-              Large files are not previewed automatically
-            </M.Typography>
-            <M.Button variant="outlined" onClick={fetch}>
-              Load preview
-            </M.Button>
-          </Section>
-        ),
-        Pending: () => (
-          <Section heading={heading}>
-            <ContentSkel />
-          </Section>
-        ),
-        Err: (_, { fetch }) => (
-          <Section heading={heading}>
-            <M.Typography variant="body1" gutterBottom>
-              Error loading preview
-            </M.Typography>
-            <M.Button variant="outlined" onClick={fetch}>
-              Retry
-            </M.Button>
-          </Section>
-        ),
-        Ok: (data) => (
-          <Section heading={heading}>
-            <PreviewBox data={data} expanded={expanded} />
-          </Section>
-        ),
-      }),
-      Err: Preview.PreviewError.case({
-        DoesNotExist: (...args) => (fallback ? fallback(...args) : null),
-        _: (_, { fetch }) => (
-          <Section heading={heading}>
-            <M.Typography variant="body1" gutterBottom>
-              Error loading preview
-            </M.Typography>
-            <M.Button variant="outlined" onClick={fetch}>
-              Retry
-            </M.Button>
-          </Section>
-        ),
-      }),
-      _: () => (
-        <Section heading={heading}>
-          <ContentSkel />
-        </Section>
-      ),
-    }),
+  // TODO: check for glacier and hide items
+  return (
+    <Section heading={heading}>
+      {Preview.load(
+        handle,
+        Preview.display({
+          renderContents: (contents) => <PreviewBox {...{ contents, expanded }} />,
+          renderProgress: () => <ContentSkel />,
+        }),
+      )}
+    </Section>
   )
+}
+
+function EnsureAvailability({ s3, handle, children }) {
+  return useData(requests.ensureObjectIsPresent, { s3, ...handle }).case({
+    _: () => null,
+    Ok: (h) => !!h && children(),
+  })
 }
 
 const HeadingSkel = (props) => (
@@ -1080,9 +1048,12 @@ function Thumbnails({ images }) {
   const { urls } = NamedRoutes.use()
 
   const scrollRef = React.useRef(null)
-  const scroll = React.useCallback((prev) => {
-    if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
-  })
+  const scroll = React.useCallback(
+    (prev) => {
+      if (prev && scrollRef.current) scrollRef.current.scrollIntoView()
+    },
+    [scrollRef],
+  )
 
   const pagination = Pagination.use(images, { perPage: 25, onChange: scroll })
 
@@ -1148,9 +1119,9 @@ function Readmes({ s3, overviewUrl, bucket }) {
   )
 }
 
-function Imgs({ es, s3, overviewUrl, inStack, bucket }) {
+function Imgs({ req, s3, overviewUrl, inStack, bucket }) {
   return (
-    <Data fetch={requests.bucketImgs} params={{ es, s3, overviewUrl, inStack, bucket }}>
+    <Data fetch={requests.bucketImgs} params={{ req, s3, overviewUrl, inStack, bucket }}>
       {AsyncResult.case({
         Ok: (images) => (images.length ? <Thumbnails images={images} /> : null),
         _: () => (
@@ -1173,8 +1144,8 @@ function Imgs({ es, s3, overviewUrl, inStack, bucket }) {
 
 const SUMMARY_ENTRIES = 7
 
-function Summary({ es, s3, bucket, inStack, overviewUrl }) {
-  const data = useData(requests.bucketSummary, { es, s3, bucket, inStack, overviewUrl })
+function Summary({ req, s3, bucket, inStack, overviewUrl }) {
+  const data = useData(requests.bucketSummary, { req, s3, bucket, inStack, overviewUrl })
   const [shown, setShown] = React.useState(SUMMARY_ENTRIES)
   const showMore = React.useCallback(() => {
     setShown(R.add(SUMMARY_ENTRIES))
@@ -1185,7 +1156,9 @@ function Summary({ es, s3, bucket, inStack, overviewUrl }) {
       return (
         <>
           {shownEntries.map((h) => (
-            <FilePreview key={`${h.bucket}/${h.key}`} handle={h} />
+            <EnsureAvailability key={`${h.bucket}/${h.key}`} s3={s3} handle={h}>
+              {() => <FilePreview handle={h} />}
+            </EnsureAvailability>
           ))}
           {shown < entries.length && (
             <M.Box mt={2} display="flex" justifyContent="center">
@@ -1208,7 +1181,7 @@ export default function Overview({
   },
 }) {
   const s3 = AWS.S3.use()
-  const es = AWS.ES.use()
+  const req = AWS.APIGateway.use()
   const { noOverviewImages } = Config.use()
   const cfg = BucketConfig.useCurrentBucketConfig()
   const inStack = !!cfg
@@ -1222,7 +1195,7 @@ export default function Overview({
         </React.Suspense>
       )}
       {cfg ? (
-        <Head {...{ es, s3, bucket, overviewUrl, description }} />
+        <Head {...{ req, s3, bucket, overviewUrl, description }} />
       ) : (
         <M.Box
           pt={2}
@@ -1234,8 +1207,8 @@ export default function Overview({
         </M.Box>
       )}
       <Readmes {...{ s3, bucket, overviewUrl }} />
-      {!noOverviewImages && <Imgs {...{ es, s3, bucket, inStack, overviewUrl }} />}
-      <Summary {...{ es, s3, bucket, inStack, overviewUrl }} />
+      {!noOverviewImages && <Imgs {...{ req, s3, bucket, inStack, overviewUrl }} />}
+      <Summary {...{ req, s3, bucket, inStack, overviewUrl }} />
     </M.Box>
   )
 }

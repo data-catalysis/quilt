@@ -10,12 +10,16 @@ import subprocess
 import sys
 import time
 
-from botocore.credentials import CredentialProvider, CredentialResolver, RefreshableCredentials
+import botocore.session
 import pkg_resources
 import requests
+from botocore.credentials import (
+    CredentialProvider,
+    CredentialResolver,
+    RefreshableCredentials,
+)
 
-from .util import BASE_PATH, get_from_config, QuiltException
-
+from .util import BASE_PATH, QuiltException, get_from_config
 
 AUTH_PATH = BASE_PATH / 'auth.json'
 CREDENTIALS_PATH = BASE_PATH / 'credentials.json'
@@ -122,9 +126,9 @@ def _create_session(auth):
     Creates a session object to be used for `push`, `install`, etc.
     """
     session = requests.Session()
-    session.hooks.update(dict(
+    session.hooks.update(
         response=_handle_response
-    ))
+    )
     session.headers.update({
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -269,6 +273,7 @@ class QuiltProvider(CredentialProvider):
     CANONICAL_NAME = 'QuiltRegistry'
 
     def __init__(self, credentials):
+        super().__init__()
         self._credentials = credentials
 
     def load(self):
@@ -282,9 +287,7 @@ class QuiltProvider(CredentialProvider):
 
 
 def create_botocore_session():
-    from botocore.session import get_session as botocore_get_session  # Don't override our own get_session
-
-    botocore_session = botocore_get_session()
+    botocore_session = botocore.session.get_session()
 
     # If we have saved credentials, use them. Otherwise, create a normal Boto session.
     credentials = _load_credentials()

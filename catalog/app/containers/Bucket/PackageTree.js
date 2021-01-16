@@ -5,9 +5,12 @@ import * as R from 'ramda'
 import * as React from 'react'
 import { Link as RRLink } from 'react-router-dom'
 import * as M from '@material-ui/core'
+import * as Lab from '@material-ui/lab'
 
 import { Crumb, copyWithoutSpaces, render as renderCrumbs } from 'components/BreadCrumbs'
-import Skeleton from 'components/Skeleton'
+import * as Intercom from 'components/Intercom'
+import * as Preview from 'components/Preview'
+import * as Notifications from 'containers/Notifications'
 import AsyncResult from 'utils/AsyncResult'
 import * as AWS from 'utils/AWS'
 import * as BucketConfig from 'utils/BucketConfig'
@@ -15,17 +18,29 @@ import * as Config from 'utils/Config'
 import Data, { useData } from 'utils/Data'
 import * as LinkedData from 'utils/LinkedData'
 import * as NamedRoutes from 'utils/NamedRoutes'
+import * as PackageUri from 'utils/PackageUri'
 import Link, { linkStyle } from 'utils/StyledLink'
+import copyToClipboard from 'utils/clipboard'
+import parseSearch from 'utils/parseSearch'
 import * as s3paths from 'utils/s3paths'
+import usePrevious from 'utils/usePrevious'
 
 import Code from './Code'
-import FilePreview from './FilePreview'
-import Listing, { ListingItem } from './Listing'
+import CopyButton from './CopyButton'
+import * as FileView from './FileView'
+import { ListingItem, ListingWithLocalFiltering } from './Listing'
+import { usePackageUpdateDialog } from './PackageUpdateDialog'
+import PackageCopyDialog from './PackageCopyDialog'
 import Section from './Section'
 import Summary from './Summary'
+import * as errors from './errors'
+import renderPreview from './renderPreview'
 import * as requests from './requests'
 
-const MAX_REVISIONS = 5
+function useRevisionsData({ bucket, name }) {
+  const req = AWS.APIGateway.use()
+  return useData(requests.getPackageRevisions, { req, bucket, name, perPage: 5 })
+}
 
 const useRevisionInfoStyles = M.makeStyles((t) => ({
   revision: {
@@ -50,33 +65,64 @@ const useRevisionInfoStyles = M.makeStyles((t) => ({
   },
 }))
 
-function RevisionInfo({ revision, bucket, name, path }) {
-  const s3 = AWS.S3.use()
-  const sign = AWS.Signer.useS3Signer()
-  const { apiGatewayEndpoint: endpoint } = Config.useConfig()
+function RevisionInfo({ revisionData, revision, bucket, name, path }) {
   const { urls } = NamedRoutes.use()
-  const today = React.useMemo(() => new Date(), [])
+  const { push } = Notifications.use()
+  const classes = useRevisionInfoStyles()
 
+  const listRef = React.useRef()
   const [anchor, setAnchor] = React.useState()
   const [opened, setOpened] = React.useState(false)
   const open = React.useCallback(() => setOpened(true), [])
   const close = React.useCallback(() => setOpened(false), [])
 
-  const classes = useRevisionInfoStyles()
+  const revisionsData = useRevisionsData({ bucket, name })
+  const data = revisionsData.case({
+    Ok: (revisions) =>
+      revisionData.case({
+        Ok: ({ hash }) =>
+          AsyncResult.Ok(revisions.map((r) => ({ ...r, selected: r.hash === hash }))),
+        Err: () => AsyncResult.Ok(revisions),
+        _: R.identity,
+      }),
+    _: R.identity,
+  })
 
-  const data = useData(requests.getPackageRevisions, { s3, bucket, name, today })
+  const getHttpsUri = (r) =>
+    `${window.origin}${urls.bucketPackageTree(bucket, name, r.hash, path)}`
+
+  const copyHttpsUri = (r, containerRef) => (e) => {
+    e.preventDefault()
+    copyToClipboard(getHttpsUri(r), { container: containerRef && containerRef.current })
+    push('Canonical URI copied to clipboard')
+  }
 
   return (
     <>
       {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-static-element-interactions */}
-      <span className={classes.revision} onClick={open} ref={setAnchor}>
-        {revision === 'latest' ? (
-          'latest'
-        ) : (
-          <span className={classes.mono}>{revision}</span>
-        )}{' '}
-        <M.Icon>expand_more</M.Icon>
+      <span
+        className={classes.revision}
+        onClick={open}
+        ref={setAnchor}
+        title={revision.length > 10 ? revision : undefined}
+      >
+        {R.take(10, revision)} <M.Icon>expand_more</M.Icon>
       </span>
+
+      {revisionData.case({
+        Ok: (r) => (
+          <M.IconButton
+            size="small"
+            title="Copy package revision's canonical catalog URI to the clipboard"
+            href={getHttpsUri(r)}
+            onClick={copyHttpsUri(r)}
+            style={{ marginTop: -4, marginBottom: -4 }}
+          >
+            <M.Icon>link</M.Icon>
+          </M.IconButton>
+        ),
+        _: () => null,
+      })}
 
       <M.Popover
         open={opened && !!anchor}
@@ -85,134 +131,60 @@ function RevisionInfo({ revision, bucket, name, path }) {
         anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
         transformOrigin={{ vertical: 'top', horizontal: 'center' }}
       >
-        <M.List className={classes.list}>
-          {data.case({
-            Ok: ({ revisions, isTruncated }) => {
-              const revList = revisions.slice(0, MAX_REVISIONS).map((r) => (
-                <Data
-                  key={r}
-                  fetch={requests.getRevisionData}
-                  params={{ s3, sign, endpoint, bucket, name, id: r, maxKeys: 0 }}
+        <M.List className={classes.list} ref={listRef}>
+          {AsyncResult.case(
+            {
+              Ok: R.map((r) => (
+                <M.ListItem
+                  key={r.hash}
+                  button
+                  onClick={close}
+                  selected={r.selected}
+                  component={RRLink}
+                  to={urls.bucketPackageTree(bucket, name, r.hash, path)}
                 >
-                  {(res) => {
-                    const modified =
-                      r === 'latest'
-                        ? AsyncResult.prop('modified', res)
-                        : AsyncResult.Ok(new Date(parseInt(r, 10) * 1000))
-                    const hash = AsyncResult.prop('hash', res)
-                    const msg = AsyncResult.prop('message', res)
-                    return (
-                      <M.ListItem
-                        key={r}
-                        button
-                        onClick={close}
-                        selected={r === revision}
-                        component={RRLink}
-                        to={urls.bucketPackageTree(bucket, name, r, path)}
-                      >
-                        <M.ListItemText
-                          primary={
-                            <>
-                              {r === 'latest' ? (
-                                'LATEST'
-                              ) : (
-                                <span className={classes.mono}>{r}</span>
-                              )}
-                              {AsyncResult.case(
-                                {
-                                  _: () => null,
-                                  Ok: (d) => (
-                                    <>
-                                      {' | '}
-                                      {dateFns.format(d, 'MMMM do yyyy - h:mma')}
-                                    </>
-                                  ),
-                                },
-                                modified,
-                              )}
-                            </>
-                          }
-                          secondary={
-                            <span className={classes.secondaryText}>
-                              {AsyncResult.case(
-                                {
-                                  Ok: (v) => (
-                                    <span className={classes.line}>
-                                      {v || <i>No message</i>}
-                                    </span>
-                                  ),
-                                  _: () => (
-                                    <Skeleton
-                                      component="span"
-                                      display="inline-block"
-                                      borderRadius="borderRadius"
-                                      height={16}
-                                      width="90%"
-                                    />
-                                  ),
-                                },
-                                msg,
-                              )}
-                              <br />
-                              {AsyncResult.case(
-                                {
-                                  Ok: (v) => (
-                                    <span className={cx(classes.line, classes.mono)}>
-                                      {v}
-                                    </span>
-                                  ),
-                                  _: () => (
-                                    <Skeleton
-                                      component="span"
-                                      display="inline-block"
-                                      borderRadius="borderRadius"
-                                      height={16}
-                                      width="95%"
-                                    />
-                                  ),
-                                },
-                                hash,
-                              )}
-                            </span>
-                          }
-                        />
-                      </M.ListItem>
-                    )
-                  }}
-                </Data>
-              ))
-              if (isTruncated) {
-                revList.unshift(
-                  <M.ListItem key="__truncated">
-                    <M.ListItemText
-                      primary="Revision list is truncated"
-                      secondary="Latest revisions are not shown"
-                    />
-                    <M.ListItemSecondaryAction>
-                      <M.Icon>warning</M.Icon>
-                    </M.ListItemSecondaryAction>
-                  </M.ListItem>,
-                )
-              }
-              return revList
+                  <M.ListItemText
+                    primary={dateFns.format(r.modified, 'MMMM do yyyy - h:mma')}
+                    secondary={
+                      <span className={classes.secondaryText}>
+                        <span className={classes.line}>
+                          {r.message || <i>No message</i>}
+                        </span>
+                        <br />
+                        <span className={cx(classes.line, classes.mono)}>{r.hash}</span>
+                      </span>
+                    }
+                  />
+                  <M.ListItemSecondaryAction>
+                    <M.IconButton
+                      title="Copy package revision's canonical catalog URI to the clipboard"
+                      href={getHttpsUri(r)}
+                      onClick={copyHttpsUri(r, listRef)}
+                    >
+                      <M.Icon>link</M.Icon>
+                    </M.IconButton>
+                  </M.ListItemSecondaryAction>
+                </M.ListItem>
+              )),
+              Err: () => (
+                <M.ListItem>
+                  <M.ListItemIcon>
+                    <M.Icon>error</M.Icon>
+                  </M.ListItemIcon>
+                  <M.Typography variant="body1">Error fetching revisions</M.Typography>
+                </M.ListItem>
+              ),
+              _: () => (
+                <M.ListItem>
+                  <M.ListItemIcon>
+                    <M.CircularProgress size={24} />
+                  </M.ListItemIcon>
+                  <M.Typography variant="body1">Fetching revisions</M.Typography>
+                </M.ListItem>
+              ),
             },
-            Err: () => (
-              <M.ListItem>
-                <M.ListItemIcon>
-                  <M.Icon>error</M.Icon>
-                </M.ListItemIcon>
-                <M.Typography variant="body1">Error fetching revisions</M.Typography>
-              </M.ListItem>
-            ),
-            _: () => (
-              <M.ListItem>
-                <M.ListItemIcon>
-                  <M.CircularProgress size={24} />
-                </M.ListItemIcon>
-                <M.Typography variant="body1">Fetching revisions</M.Typography>
-              </M.ListItem>
-            ),
-          })}
+            data,
+          )}
           <M.Divider />
           <M.ListItem
             button
@@ -230,69 +202,113 @@ function RevisionInfo({ revision, bucket, name, path }) {
   )
 }
 
-function ExposeLinkedData({ bucketCfg, bucket, name, revision }) {
-  const s3 = AWS.S3.use()
+function ExposeLinkedData({ bucketCfg, bucket, name, hash, modified }) {
   const sign = AWS.Signer.useS3Signer()
   const { apiGatewayEndpoint: endpoint } = Config.use()
   const data = useData(requests.getRevisionData, {
-    s3,
     sign,
     endpoint,
     bucket,
-    name,
-    id: revision,
+    hash,
     maxKeys: 0,
   })
   return data.case({
     _: () => null,
-    Ok: ({ hash, modified, header }) => (
+    Ok: ({ header }) => (
       <React.Suspense fallback={null}>
         <LinkedData.PackageData
-          {...{ bucket: bucketCfg, name, revision, hash, modified, header }}
+          {...{ bucket: bucketCfg, name, hash, modified, header }}
         />
       </React.Suspense>
     ),
   })
 }
 
-function PkgCode({ data, bucket, name, revision, path }) {
-  const code = data.case({
-    Ok: ({ hash }) => {
-      const nameWithPath = path ? `${name}/${path}` : name
-      const hashDisplay = revision === 'latest' ? '' : hash.substring(0, 10)
-      const hashPy = hashDisplay && `, top_hash="${hashDisplay}"`
-      const hashCli = hashDisplay && ` --top-hash ${hashDisplay}`
-      return [
-        {
-          label: 'Python',
-          hl: 'python',
-          contents: dedent`
-            import quilt3
-            # browse
-            quilt3.Package.browse("${name}"${hashPy}, registry="s3://${bucket}")
-            # download
-            quilt3.Package.install("${nameWithPath}"${hashPy}, registry="s3://${bucket}", dest=".")
-          `,
-        },
-        {
-          label: 'CLI',
-          hl: 'bash',
-          contents: dedent`
-            quilt3 install ${nameWithPath}${hashCli} --registry s3://${bucket} --dest .
-          `,
-        },
-      ]
+function PkgCode({ bucket, name, hash, revision, path }) {
+  const nameWithPath = JSON.stringify(s3paths.ensureNoSlash(`${name}/${path}`))
+  const hashDisplay = revision === 'latest' ? '' : R.take(10, hash)
+  const hashPy = hashDisplay && `, top_hash="${hashDisplay}"`
+  const hashCli = hashDisplay && ` --top-hash ${hashDisplay}`
+  const code = [
+    {
+      label: 'Python',
+      hl: 'python',
+      contents: dedent`
+        import quilt3
+        # browse
+        p = quilt3.Package.browse("${name}"${hashPy}, registry="s3://${bucket}")
+        # download (be mindful of large packages)
+        quilt3.Package.install(${nameWithPath}${hashPy}, registry="s3://${bucket}", dest=".")
+      `,
     },
-    _: () => null,
-  })
-  return code && <Code>{code}</Code>
+    {
+      label: 'CLI',
+      hl: 'bash',
+      contents: dedent`
+        quilt3 install ${nameWithPath}${hashCli} --registry s3://${bucket} --dest .
+      `,
+    },
+    {
+      label: 'URI',
+      contents: PackageUri.stringify({ bucket, name, hash, path }),
+    },
+  ]
+  return <Code>{code}</Code>
 }
 
-function DirDisplay({ bucket, name, revision, path }) {
+const useTopBarStyles = M.makeStyles((t) => ({
+  topBar: {
+    alignItems: 'flex-end',
+    display: 'flex',
+    marginBottom: t.spacing(2),
+    marginTop: t.spacing(0.5),
+  },
+  crumbs: {
+    ...t.typography.body1,
+    maxWidth: 'calc(100% - 160px)',
+    overflowWrap: 'break-word',
+    [t.breakpoints.down('xs')]: {
+      maxWidth: 'calc(100% - 40px)',
+    },
+  },
+  spacer: {
+    flexGrow: 1,
+  },
+}))
+
+function TopBar({ crumbs, children }) {
+  const classes = useTopBarStyles()
+  return (
+    <div className={classes.topBar}>
+      <div className={classes.crumbs} onCopy={copyWithoutSpaces}>
+        {renderCrumbs(crumbs)}
+      </div>
+      <div className={classes.spacer} />
+      {children}
+    </div>
+  )
+}
+
+function DirDisplay({
+  bucket,
+  name,
+  hash,
+  revision,
+  path,
+  crumbs,
+  onRevisionPush,
+  onCrossBucketPush,
+}) {
   const s3 = AWS.S3.use()
-  const { apiGatewayEndpoint: endpoint } = Config.use()
+  const { apiGatewayEndpoint: endpoint, noDownload } = Config.use()
   const credentials = AWS.Credentials.use()
   const { urls } = NamedRoutes.use()
+  const intercom = Intercom.use()
+
+  const showIntercom = React.useMemo(
+    () => (intercom.dummy ? null : () => intercom('show')),
+    [intercom],
+  )
 
   const data = useData(requests.packageSelect, {
     s3,
@@ -300,33 +316,39 @@ function DirDisplay({ bucket, name, revision, path }) {
     endpoint,
     bucket,
     name,
-    revision,
+    hash,
     prefix: path,
   })
 
-  const hashData = useData(requests.loadRevisionHash, { s3, bucket, name, id: revision })
-
-  const resolveLogicalKey = React.useCallback(
-    (logicalKey) =>
-      requests.packageFileDetail({
-        s3,
-        credentials,
-        endpoint,
-        bucket,
-        name,
-        revision,
-        path: logicalKey,
-      }),
-    [s3, credentials, endpoint, bucket, name, revision, path],
-  )
-
   const mkUrl = React.useCallback(
     (handle) => urls.bucketPackageTree(bucket, name, revision, handle.logicalKey),
-    [urls.bucketPackageTree, bucket, name, revision, path],
+    [urls, bucket, name, revision],
   )
 
+  const updateDialog = usePackageUpdateDialog({
+    bucket,
+    name,
+    hash,
+    onExited: onRevisionPush,
+  })
+
+  const [successor, setSuccessor] = React.useState(null)
+
+  const onPackageCopyDialogExited = React.useCallback(
+    (res) => {
+      if (res && res.pushed) onCrossBucketPush(res)
+      setSuccessor(null)
+    },
+    [setSuccessor, onCrossBucketPush],
+  )
+
+  usePrevious({ bucket, name, revision }, (prev) => {
+    // close the dialog when navigating away
+    if (!R.equals({ bucket, name, revision }, prev)) updateDialog.close()
+  })
+
   return data.case({
-    Ok: ({ objects, prefixes }) => {
+    Ok: ({ objects, prefixes, meta }) => {
       const up =
         path === ''
           ? []
@@ -342,54 +364,113 @@ function DirDisplay({ bucket, name, revision, path }) {
           to: urls.bucketPackageTree(bucket, name, revision, path + p),
         }),
       )
-      const files = objects.map((basename) =>
+      const files = objects.map((o) =>
         ListingItem.File({
-          name: basename,
-          to: urls.bucketPackageTree(bucket, name, revision, path + basename),
+          name: o.name,
+          to: urls.bucketPackageTree(bucket, name, revision, path + o.name),
+          size: o.size,
         }),
       )
       const items = [...up, ...dirs, ...files]
-      const lazyHandles = objects.map((basename) => ({ logicalKey: path + basename }))
+      const summaryHandles = objects.map((o) => ({
+        ...s3paths.parseS3Url(o.physicalKey),
+        logicalKey: path + o.name,
+      }))
       return (
         <>
-          <PkgCode {...{ data: hashData, bucket, name, revision, path }} />
+          <PackageCopyDialog
+            bucket={bucket}
+            hash={hash}
+            name={name}
+            open={!!successor}
+            successor={successor}
+            onExited={onPackageCopyDialogExited}
+          />
+
+          {updateDialog.render()}
+
+          <TopBar crumbs={crumbs}>
+            <M.Button
+              variant="contained"
+              color="primary"
+              size="small"
+              style={{ marginTop: -3, marginBottom: -3, flexShrink: 0 }}
+              onClick={updateDialog.open}
+            >
+              Revise package
+            </M.Button>
+            <M.Box ml={1} />
+            <CopyButton bucket={bucket} onChange={setSuccessor} />
+            {!noDownload && (
+              <>
+                <M.Box ml={1} />
+                <FileView.ZipDownloadForm
+                  label="Download package"
+                  suffix={`package/${bucket}/${name}/${hash}`}
+                />
+              </>
+            )}
+          </TopBar>
+          <PkgCode {...{ bucket, name, hash, revision, path }} />
+          <FileView.Meta data={AsyncResult.Ok(meta)} />
           <M.Box mt={2}>
-            <Listing items={items} />
-            <Summary
-              files={lazyHandles}
-              resolveLogicalKey={resolveLogicalKey}
-              mkUrl={mkUrl}
-            />
+            <ListingWithLocalFiltering items={items} />
+            <Summary files={summaryHandles} mkUrl={mkUrl} />
           </M.Box>
         </>
       )
     },
     Err: (e) => {
-      console.error(e)
+      let heading = 'Error loading directory'
+      let body = "Seems like there's no such directory in this package"
+      if (e.status === 500 && /Could not reserve memory block/.test(e.message)) {
+        heading = 'Oops, this is a large package'
+        body = (
+          <>
+            The Lambda process ran out of memory
+            {!!showIntercom && (
+              <>
+                , but don&apos;t worry,{' '}
+                {/* eslint-disable-next-line jsx-a11y/anchor-is-valid */}
+                <Link component="span" role="button" onClick={showIntercom}>
+                  we can fix it
+                </Link>
+              </>
+            )}
+            .
+          </>
+        )
+      }
       return (
-        <M.Box mt={4}>
-          <M.Typography variant="h4" align="center" gutterBottom>
-            Error loading directory
-          </M.Typography>
-          <M.Typography variant="body1" align="center">
-            Seems like there&apos;s no such directory in this package
-          </M.Typography>
-        </M.Box>
+        <>
+          <TopBar crumbs={crumbs} />
+          <M.Box mt={4}>
+            <M.Typography variant="h4" align="center" gutterBottom>
+              {heading}
+            </M.Typography>
+            <M.Typography variant="body1" align="center">
+              {body}
+            </M.Typography>
+          </M.Box>
+        </>
       )
     },
     _: () => (
       // TODO: skeleton placeholder
-      <M.Box mt={2}>
-        <M.CircularProgress />
-      </M.Box>
+      <>
+        <TopBar crumbs={crumbs} />
+        <M.Box mt={2}>
+          <M.CircularProgress />
+        </M.Box>
+      </>
     ),
   })
 }
 
-function FileDisplay({ bucket, name, revision, path }) {
+function FileDisplay({ bucket, name, hash, revision, path, crumbs }) {
   const s3 = AWS.S3.use()
-  const { apiGatewayEndpoint: endpoint } = Config.use()
   const credentials = AWS.Credentials.use()
+  const { apiGatewayEndpoint: endpoint, noDownload } = Config.use()
 
   const data = useData(requests.packageFileDetail, {
     s3,
@@ -397,80 +478,99 @@ function FileDisplay({ bucket, name, revision, path }) {
     endpoint,
     bucket,
     name,
-    revision,
+    hash,
     path,
   })
 
-  const hashData = useData(requests.loadRevisionHash, { s3, bucket, name, id: revision })
-
-  return data.case({
-    Ok: (handle) => (
-      <>
-        <PkgCode {...{ data: hashData, bucket, name, revision, path }} />
-        <Section icon="remove_red_eye" heading="Preview" expandable={false}>
-          <FilePreview handle={handle} />
-        </Section>
-      </>
-    ),
-    Err: (e) => {
-      console.error(e)
-      return (
-        <M.Box mt={4}>
-          <M.Typography variant="h4" align="center" gutterBottom>
-            Error loading file
-          </M.Typography>
-          <M.Typography variant="body1" align="center">
-            Seems like there&apos;s no such file in this package
-          </M.Typography>
-        </M.Box>
-      )
-    },
-    _: () => (
-      // TODO: skeleton placeholder
+  const renderProgress = () => (
+    // TODO: skeleton placeholder
+    <>
+      <TopBar crumbs={crumbs} />
       <M.Box mt={2}>
         <M.CircularProgress />
       </M.Box>
+    </>
+  )
+
+  const renderError = (headline, detail) => (
+    <>
+      <TopBar crumbs={crumbs} />
+      <M.Box mt={4}>
+        <M.Typography variant="h4" align="center" gutterBottom>
+          {headline}
+        </M.Typography>
+        {!!detail && (
+          <M.Typography variant="body1" align="center">
+            {detail}
+          </M.Typography>
+        )}
+      </M.Box>
+    </>
+  )
+
+  const withPreview = ({ archived, deleted, handle }, callback) => {
+    if (deleted) {
+      return callback(AsyncResult.Err(Preview.PreviewError.Deleted({ handle })))
+    }
+    if (archived) {
+      return callback(AsyncResult.Err(Preview.PreviewError.Archived({ handle })))
+    }
+    return Preview.load(handle, callback)
+  }
+
+  return data.case({
+    Ok: ({ meta, ...handle }) => (
+      <Data fetch={requests.getObjectExistence} params={{ s3, ...handle }}>
+        {AsyncResult.case({
+          _: renderProgress,
+          Err: (e) => {
+            if (e.code === 'Forbidden') {
+              return renderError('Access Denied', "You don't have access to this object")
+            }
+            // eslint-disable-next-line no-console
+            console.error(e)
+            return renderError('Error loading file', 'Something went wrong')
+          },
+          Ok: requests.ObjectExistence.case({
+            Exists: ({ archived, deleted }) => (
+              <>
+                <TopBar crumbs={crumbs}>
+                  {!noDownload && !deleted && !archived && (
+                    <FileView.DownloadButton handle={handle} />
+                  )}
+                </TopBar>
+                <PkgCode {...{ bucket, name, hash, revision, path }} />
+                <FileView.Meta data={AsyncResult.Ok(meta)} />
+                <Section icon="remove_red_eye" heading="Preview" expandable={false}>
+                  {withPreview({ archived, deleted, handle }, renderPreview)}
+                </Section>
+              </>
+            ),
+            _: () => renderError('No Such Object'),
+          }),
+        })}
+      </Data>
     ),
+    Err: (e) => {
+      // eslint-disable-next-line no-console
+      console.error(e)
+      return renderError(
+        'Error loading file',
+        "Seems like there's no such file in this package",
+      )
+    },
+    _: renderProgress,
   })
 }
 
-const useStyles = M.makeStyles((t) => ({
-  topBar: {
-    alignItems: 'flex-end',
-    display: 'flex',
-    marginBottom: t.spacing(2),
-  },
-  crumbs: {
-    ...t.typography.body1,
-    maxWidth: 'calc(100% - 160px)',
-    overflowWrap: 'break-word',
-    [t.breakpoints.down('xs')]: {
-      maxWidth: 'calc(100% - 40px)',
-    },
-  },
+const useStyles = M.makeStyles(() => ({
   name: {
     wordBreak: 'break-all',
   },
-  spacer: {
-    flexGrow: 1,
-  },
-  button: {
-    flexShrink: 0,
-    marginBottom: -3,
-    marginTop: -3,
-  },
-  warning: {
-    background: t.palette.warning.light,
-    borderRadius: t.shape.borderRadius,
-    display: 'flex',
-    padding: t.spacing(1.5),
-    ...t.typography.body2,
-  },
-  warningIcon: {
-    height: 20,
-    lineHeight: '20px',
-    marginRight: t.spacing(1),
-    opacity: 0.6,
+  alertMsg: {
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+    whiteSpace: 'nowrap',
   },
 }))
 
@@ -478,23 +578,20 @@ export default function PackageTree({
   match: {
     params: { bucket, name, revision = 'latest', path: encodedPath = '' },
   },
+  location,
 }) {
   const classes = useStyles()
   const s3 = AWS.S3.use()
   const { urls } = NamedRoutes.use()
-  const getSignedS3URL = AWS.Signer.useS3Signer()
-  const { apiGatewayEndpoint: endpoint, noDownload } = Config.use()
-  const t = M.useTheme()
-  const xs = M.useMediaQuery(t.breakpoints.down('xs'))
-  const credentials = AWS.Credentials.use()
   const bucketCfg = BucketConfig.useCurrentBucketConfig()
 
   const path = s3paths.decode(encodedPath)
   const isDir = s3paths.isDir(path)
 
+  const { resolvedFrom } = parseSearch(location.search)
+
   const crumbs = React.useMemo(() => {
-    const segments = s3paths.getBreadCrumbs(path)
-    if (path !== '') segments.unshift({ label: 'ROOT', path: '' })
+    const segments = [{ label: 'ROOT', path: '' }, ...s3paths.getBreadCrumbs(path)]
     return R.intersperse(
       Crumb.Sep(<>&nbsp;/ </>),
       segments.map(({ label, path: segPath }) =>
@@ -509,61 +606,135 @@ export default function PackageTree({
     ).concat(path.endsWith('/') ? Crumb.Sep(<>&nbsp;/</>) : [])
   }, [bucket, name, revision, path, urls])
 
+  const [revisionKey, setRevisionKey] = React.useState(1)
+  const [revisionListKey, setRevisionListKey] = React.useState(1)
+
+  const onRevisionPush = React.useCallback(
+    (res) => {
+      const pushedSamePackage = R.pathEq(['pushed', 'name'], name, res)
+      if (pushedSamePackage) {
+        // refresh revision list if a new revision of the current package has been pushed
+        setRevisionListKey(R.inc)
+        if (revision === 'latest') {
+          // when browsing 'latest' revision, also refresh the package view
+          setRevisionKey(R.inc)
+        }
+      }
+    },
+    [name, revision, setRevisionKey, setRevisionListKey],
+  )
+
+  const onCrossBucketPush = React.useCallback(() => {
+    setRevisionKey(R.inc)
+  }, [setRevisionKey])
+
+  const revisionData = useData(requests.resolvePackageRevision, {
+    s3,
+    bucket,
+    name,
+    revision,
+    revisionKey,
+  })
+
   return (
-    <M.Box pt={2} pb={4}>
-      {!!bucketCfg && <ExposeLinkedData {...{ bucketCfg, bucket, name, revision }} />}
+    <FileView.Root>
+      {!!bucketCfg &&
+        revisionData.case({
+          Ok: ({ hash, modified }) => (
+            <ExposeLinkedData {...{ bucketCfg, bucket, name, hash, modified }} />
+          ),
+          _: () => null,
+        })}
+      {!!resolvedFrom && (
+        <M.Box mb={2}>
+          <Lab.Alert
+            severity="info"
+            icon={false}
+            classes={{ message: classes.alertMsg }}
+            action={
+              <M.IconButton
+                size="small"
+                color="inherit"
+                component={RRLink}
+                to={urls.bucketPackageTree(bucket, name, revision, path)}
+              >
+                <M.Icon fontSize="small">close</M.Icon>
+              </M.IconButton>
+            }
+          >
+            Resolved from{' '}
+            <M.Box
+              fontFamily="monospace.fontFamily"
+              fontWeight="fontWeightBold"
+              component="span"
+              title={resolvedFrom}
+            >
+              {resolvedFrom}
+            </M.Box>
+          </Lab.Alert>
+        </M.Box>
+      )}
       <M.Typography variant="body1">
         <Link to={urls.bucketPackageDetail(bucket, name)} className={classes.name}>
           {name}
         </Link>
         {' @ '}
-        <RevisionInfo {...{ revision, bucket, name, path }} />
+        <RevisionInfo
+          {...{ revisionData, revision, bucket, name, path }}
+          key={`revinfo:${revisionListKey}`}
+        />
       </M.Typography>
-      <div className={classes.topBar}>
-        <div className={classes.crumbs} onCopy={copyWithoutSpaces}>
-          {renderCrumbs(crumbs)}
-        </div>
-        <div className={classes.spacer} />
-        {!noDownload && !isDir && (
-          <Data
-            fetch={requests.packageFileDetail}
-            params={{ s3, credentials, endpoint, bucket, name, revision, path }}
-          >
-            {AsyncResult.case({
-              Ok: (handle) =>
-                xs ? (
-                  <M.IconButton
-                    className={classes.button}
-                    href={getSignedS3URL(handle)}
-                    edge="end"
-                    size="small"
-                    download
-                  >
-                    <M.Icon>arrow_downward</M.Icon>
-                  </M.IconButton>
-                ) : (
-                  <M.Button
-                    href={getSignedS3URL(handle)}
-                    className={classes.button}
-                    variant="outlined"
-                    size="small"
-                    startIcon={<M.Icon>arrow_downward</M.Icon>}
-                    download
-                  >
-                    Download file
-                  </M.Button>
-                ),
-              _: () => null,
-            })}
-          </Data>
-        )}
-      </div>
 
-      {isDir ? (
-        <DirDisplay {...{ bucket, name, revision, path }} />
-      ) : (
-        <FileDisplay {...{ bucket, name, revision, path }} />
-      )}
-    </M.Box>
+      {revisionData.case({
+        Ok: ({ hash }) =>
+          isDir ? (
+            <DirDisplay
+              {...{
+                bucket,
+                name,
+                hash,
+                path,
+                revision,
+                crumbs,
+                onRevisionPush,
+                onCrossBucketPush,
+                key: hash,
+              }}
+            />
+          ) : (
+            <FileDisplay {...{ bucket, name, hash, revision, path, crumbs }} />
+          ),
+        Err: (e) => {
+          if (!(e instanceof errors.BadRevision)) throw e
+          return (
+            <>
+              <TopBar crumbs={crumbs} />
+              <M.Box mt={4}>
+                <M.Typography variant="h4" align="center" gutterBottom>
+                  Error resolving revision
+                </M.Typography>
+                <M.Typography variant="body1" align="center">
+                  Revision{' '}
+                  <M.Box
+                    component="span"
+                    fontWeight="fontWeightMedium"
+                  >{`"${e.revision}"`}</M.Box>{' '}
+                  could not be resolved.
+                </M.Typography>
+              </M.Box>
+            </>
+          )
+        },
+        _: () => (
+          // TODO: skeleton placeholder
+          <>
+            <TopBar crumbs={crumbs} />
+            <M.Box mt={2}>
+              <M.CircularProgress />
+            </M.Box>
+          </>
+        ),
+      })}
+    </FileView.Root>
   )
 }

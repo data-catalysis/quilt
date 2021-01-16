@@ -2,36 +2,36 @@
 Tests for the ES indexer. This function consumes events from SQS.
 """
 import datetime
+import json
+import os
 from copy import deepcopy
 from gzip import compress
 from io import BytesIO
-import json
-import os
 from math import floor
 from pathlib import Path
-from time import time
 from string import ascii_lowercase
+from time import time
 from unittest import TestCase
 from unittest.mock import ANY, patch
 from urllib.parse import unquote_plus
 
 import boto3
+import pytest
+import responses
 from botocore import UNSIGNED
 from botocore.client import Config
 from botocore.exceptions import ParamValidationError
 from botocore.stub import Stubber
 from dateutil.tz import tzutc
-import pytest
-import responses
+from document_queue import DocTypes, RetryError
 
 from t4_lambda_shared.utils import (
-    POINTER_PREFIX_V1,
     MANIFEST_PREFIX_V1,
-    separated_env_to_iter
+    POINTER_PREFIX_V1,
+    separated_env_to_iter,
 )
-from document_queue import DocTypes, RetryError
-from .. import index
 
+from .. import index
 
 BASE_DIR = Path(__file__).parent / 'data'
 
@@ -232,7 +232,9 @@ def _make_event(
                 "handle": "pkg/usr",
                 "key": "foo",
                 "last_modified": datetime.datetime(2019, 5, 30, 23, 27, 29, tzinfo=tzutc()),
+                "pointer_file": "1598026253",
                 "package_hash": "abc",
+                "package_stats": None,
             }
         ),
         (
@@ -246,6 +248,7 @@ def _make_event(
                 "key": "foo",
                 "last_modified": datetime.datetime(2019, 5, 30, 23, 27, 29, tzinfo=tzutc()),
                 "package_hash": "abc",
+                "pointer_file": "1598026253",
             }
         ),
         (
@@ -278,6 +281,25 @@ def _make_event(
             "ObjectCreated:Put",
             DocTypes.PACKAGE,
             {
+                "bucket": "test",
+                "etag": "123",
+                "ext": "",
+                "handle": "pkg/usr",
+                "key": "foo",
+                "last_modified": datetime.datetime(2019, 5, 30, 23, 27, 29, tzinfo=tzutc()),
+                "pointer_file": "1598026253",
+                "package_hash": "abc",
+                "package_stats": {"bad": "data"},
+            },
+            marks=pytest.mark.xfail(
+                raises=ValueError,
+                reason="Malformed package_stats",
+            )
+        ),
+        pytest.param(
+            "ObjectCreated:Put",
+            DocTypes.PACKAGE,
+            {
                 "bucket": "",
                 "etag": "123",
                 "ext": "",
@@ -285,6 +307,7 @@ def _make_event(
                 "key": "foo",
                 "last_modified": datetime.datetime(2019, 5, 30, 23, 27, 29, tzinfo=tzutc()),
                 "package_hash": "abc",
+                "pointer_file": "1598026253",
             },
             marks=pytest.mark.xfail(
                 raises=ValueError,
@@ -302,6 +325,7 @@ def _make_event(
                 "key": "foo",
                 "last_modified": "not_an_object",
                 "package_hash": "abc",
+                "pointer_file": "1598026253",
             },
             marks=pytest.mark.xfail(
                 raises=AttributeError,
@@ -319,6 +343,7 @@ def _make_event(
                 "key": "foo",
                 "last_modified": datetime.datetime(2019, 5, 30, 23, 27, 29, tzinfo=tzutc()),
                 "package_hash": "",
+                "pointer_file": "1598026253",
             },
             marks=pytest.mark.xfail(
                 raises=ValueError,
@@ -537,6 +562,75 @@ class TestIndex(TestCase):
                 "got {self.expected_es_calls} calls instead"
             )
 
+    @patch.object(index.DocumentQueue, 'send_all')
+    @patch.object(index.DocumentQueue, 'append')
+    @patch.object(index, 'maybe_get_contents')
+    @patch.object(index, 'index_if_manifest')
+    def test_40X(self, index_if_mock, contents_mock, append_mock, send_mock):
+        """
+        test fatal head 40Xs that will cause us to skip objects
+        """
+        bucket = "somebucket"
+        key = "events/copy-one/0.ext"
+        etag = "7b4b71116bb21d3ea7138dfe7aabf036"
+        version_ids = ["Yj1vyLWcE9FTFIIrsgk.yAX7NbJrAW7g", "null"]
+
+        error_codes = ["402", "403", "404"]
+
+        for version_id in version_ids:
+            for error_code in error_codes:
+                self.s3_stubber.add_client_error(
+                    method="head_object",
+                    service_error_code=error_code,
+                    service_message=f"An error occurred ({error_code}) when calling the HeadObject operation",
+                    http_status_code=int(error_code),
+                    expected_params={
+                        "Bucket": bucket,
+                        "Key": key,
+                        "VersionId": version_id,
+                    },
+                )
+                # in the 403 case we try again without VersionId
+                if error_code == "403" and version_id == "null":
+                    self.s3_stubber.add_client_error(
+                        method="head_object",
+                        service_error_code=error_code,
+                        service_message=f"An error occurred ({error_code}) when calling the HeadObject operation",
+                        http_status_code=int(error_code),
+                        expected_params={
+                            "Bucket": bucket,
+                            "Key": key,
+                            "IfMatch": etag,
+                        },
+                    )
+                event = make_event(
+                    "ObjectCreated:Put",
+                    bucket=bucket,
+                    key=key,
+                    size=73499,
+                    eTag=etag,
+                    region="us-west-1",
+                    versionId=version_id,
+                )
+
+                records = {
+                    "Records": [{
+                        "body": json.dumps({
+                            "Message": json.dumps({
+                                "Records": [event]
+                            })
+                        })
+                    }]
+                }
+
+                index.handler(records, None)
+
+                assert index_if_mock.call_count == 0
+                assert contents_mock.call_count == 0
+                assert append_mock.call_count == 0
+
+        assert send_mock.call_count == len(error_codes)*len(version_ids)
+
     def test_create_event_failure(self):
         """
         Check that the indexer doesn't blow up on create event failures.
@@ -628,7 +722,7 @@ class TestIndex(TestCase):
 
     def test_delete_marker_event_no_versioning(self):
         """
-        this can happen if a bucket was verisoned, and now isn't, followed by
+        this can happen if a bucket was versioned, and now isn't, followed by
         `aws s3 rm`
         """
         # don't mock head or get; this event should never call them
@@ -820,22 +914,40 @@ class TestIndex(TestCase):
         manifest_key = f"{MANIFEST_PREFIX_V1}{sha_hash}"
         # patch select_object_content since boto can't
         with patch.object(self.s3_client, 'select_object_content') as mock_select:
-            mock_select.return_value = {
-                "ResponseMetadata": ANY,
-                "Payload": [
-                    {
-                        "Stats": {}
-                    },
-                    {
-                        "Records": {
-                            "Payload": json.dumps(MANIFEST_DATA).encode(),
+            mock_select.side_effect = [
+                {
+                    "ResponseMetadata": ANY,
+                    "Payload": [
+                        {
+                            "Stats": {}
                         },
-                    },
-                    {
-                        "End": {}
-                    },
-                ]
-            }
+                        {
+                            "Records": {
+                                "Payload": json.dumps(MANIFEST_DATA).encode(),
+                            },
+                        },
+                        {
+                            "End": {}
+                        },
+                    ]
+                },
+                {
+                    "ResponseMetadata": ANY,
+                    "Payload": [
+                        {
+                            "Stats": {}
+                        },
+                        {
+                            "Records": {
+                                "Payload": b'{"total_bytes":292600212794000,"total_files":179066000}\n',
+                            },
+                        },
+                        {
+                            "End": {}
+                        },
+                    ]
+                },
+            ]
 
             self._test_index_events(
                 ["ObjectCreated:Put"],
@@ -851,10 +963,10 @@ class TestIndex(TestCase):
                 }
             )
 
-            mock_select.assert_called_once_with(
+            mock_select.assert_called_with(
                 Bucket="test-bucket",
                 Key=manifest_key,
-                Expression=index.SELECT_PACKAGE_META,
+                Expression=ANY,
                 ExpressionType="SQL",
                 # copied from t4_lambda_shared > utils.py > query_manifest_content
                 InputSerialization={
@@ -863,6 +975,8 @@ class TestIndex(TestCase):
                 },
                 OutputSerialization={'JSON': {'RecordDelimiter': '\n'}}
             )
+            # one call for metadata, one for stats
+            assert mock_select.call_count == 2
 
         append_mock.assert_any_call(
             "ObjectCreated:Put",
@@ -874,6 +988,11 @@ class TestIndex(TestCase):
             key=f".quilt/packages/{sha_hash}",
             last_modified=ANY,
             package_hash=sha_hash,
+            package_stats={
+                'total_files': 179_066_000,
+                'total_bytes': 292_600_212_794_000,
+            },
+            pointer_file=ANY,
             comment=MANIFEST_DATA["message"],
             metadata=json.dumps(MANIFEST_DATA["user_meta"])
         )

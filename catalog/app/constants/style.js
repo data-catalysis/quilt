@@ -12,10 +12,12 @@ const appPalette = {
     main: colors.orange[600],
   },
   info: {
-    main: colors.lightBlue[50],
+    main: colors.lightBlue[600],
+    light: colors.lightBlue[50],
   },
   warning: {
     main: colors.yellow[200],
+    dark: colors.yellow[900],
   },
 }
 
@@ -106,10 +108,22 @@ const websiteOverrides = {
   },
 }
 
+const mixins = {
+  // see https://css-tricks.com/almanac/properties/l/line-clamp/
+  lineClamp: (lines) => ({
+    WebkitBoxOrient: 'vertical',
+    WebkitLineClamp: lines,
+    display: '-webkit-box',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  }),
+}
+
 // default app theme
 export const appTheme = createMuiTheme({
   palette: appPalette,
   typography: appTypography,
+  mixins,
 })
 
 // theme used for navbar and footer
@@ -117,6 +131,7 @@ export const navTheme = createMuiTheme({
   palette: websitePalette,
   typography: appTypography,
   overrides: websiteOverrides,
+  mixins,
 })
 
 // theme used for marketing pages
@@ -124,13 +139,18 @@ export const websiteTheme = createMuiTheme({
   palette: websitePalette,
   typography: websiteTypography,
   overrides: websiteOverrides,
+  mixins,
 })
 
-export const createCustomAppTheme = ({ palette, typography, ...rest }, ...args) =>
+export const createCustomAppTheme = (
+  { palette, typography, mixins: mxs, ...rest },
+  ...args
+) =>
   createMuiTheme(
     {
       palette: { ...appPalette, ...palette },
       typography: { ...appTypography, ...typography },
+      mixins: { ...mixins, ...mxs },
       ...rest,
     },
     ...args,

@@ -5,6 +5,7 @@ disk and RAM pressure.
 Lambda functions can have up to 3GB of RAM and only 512MB of disk.
 """
 import io
+import os
 from contextlib import redirect_stderr
 from urllib.parse import urlparse
 
@@ -15,22 +16,25 @@ from t4_lambda_shared.decorator import api, validate
 from t4_lambda_shared.preview import (
     CATALOG_LIMIT_BYTES,
     CATALOG_LIMIT_LINES,
+    TRUNCATED,
+    extract_fcs,
     extract_parquet,
     get_bytes,
     get_preview_lines,
     remove_pandas_footer,
-    TRUNCATED
 )
 from t4_lambda_shared.utils import get_default_origins, make_json_response
 
 # Number of bytes for read routines like decompress() and
 # response.content.iter_content()
 CHUNK = 1024*8
+# We can pump a max of 6MB out of Lambda
+LAMBDA_MAX_OUT = 6_000_000
 MIN_VCF_COLS = 8  # per 4.2 spec on header and data lines
 
 S3_DOMAIN_SUFFIX = '.amazonaws.com'
 
-FILE_EXTENSIONS = ["csv", "excel", "ipynb", "parquet", "vcf"]
+FILE_EXTENSIONS = ["csv", "excel", "fcs", "ipynb", "parquet", "vcf"]
 # BED https://genome.ucsc.edu/FAQ/FAQformat.html#format1
 TEXT_TYPES = ["bed", "txt"]
 FILE_EXTENSIONS.extend(TEXT_TYPES)
@@ -128,6 +132,8 @@ def lambda_handler(request):
             )
         elif input_type == 'excel':
             html, info = extract_excel(get_bytes(content_iter, compression))
+        elif input_type == 'fcs':
+            html, info = extract_fcs(get_bytes(content_iter, compression))
         elif input_type == 'ipynb':
             html, info = extract_ipynb(get_bytes(content_iter, compression), exclude_output)
         elif input_type == 'parquet':
@@ -150,12 +156,13 @@ def lambda_handler(request):
             'info': info,
             'html': html,
         }
-
     else:
         ret_val = {
-            'error': resp.reason
+            'error': resp.reason,
+            'text': resp.text,
         }
-    return make_json_response(200, ret_val)
+
+    return make_json_response(resp.status_code, ret_val)
 
 
 def extract_csv(head, separator):
@@ -208,7 +215,7 @@ def extract_excel(file_):
     return html, {}
 
 
-def extract_ipynb(file_, exclude_output):
+def extract_ipynb(file_, exclude_output: bool):
     """
     parse and extract ipynb files
 
@@ -220,8 +227,20 @@ def extract_ipynb(file_, exclude_output):
         info - unmodified (is also passed in)
     """
     # local import reduces amortized latency, saves memory
-    from nbconvert import HTMLExporter
     import nbformat
+    from nbconvert import HTMLExporter
+
+    # get the file size
+    file_.seek(0, os.SEEK_END)
+    size = file_.tell()
+    if size > LAMBDA_MAX_OUT:
+        exclude_output = True
+    # rewind
+    file_.seek(0, os.SEEK_SET)
+
+    info = {}
+    if exclude_output:
+        info['warnings'] = "Omitted cell outputs to reduce notebook size"
 
     html_exporter = HTMLExporter()
     html_exporter.template_file = 'basic'
@@ -230,7 +249,7 @@ def extract_ipynb(file_, exclude_output):
     notebook = nbformat.read(file_, 4)
     html, _ = html_exporter.from_notebook_node(notebook)
 
-    return html, {}
+    return html, info
 
 
 def extract_vcf(head):
